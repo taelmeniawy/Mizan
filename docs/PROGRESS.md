@@ -1,6 +1,6 @@
 # Progress
 
-- Phase: 4 — accounting journal engine
-- Done: phase 3 master data, units, pricing (4 passed). Total 16 passed.
-- Next: phase 4 tests and journal/COA services.
+- Phase: 5 — purchasing, LCP FIFO, reels, landed cost
+- Done: phase 4 COA/journal/reversal/opening (6 passed). Total 22 passed.
+- Next: phase 5 tests and purchasing/inventory services.
 - Deviations: none.

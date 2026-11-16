@@ -186,6 +186,102 @@ MIGRATIONS: list[Migration] = [
         );
         """,
     ),
+    Migration(
+        3,
+        "accounting",
+        """
+        CREATE TABLE accounts (
+            id INTEGER PRIMARY KEY,
+            code TEXT NOT NULL UNIQUE,
+            name_ar TEXT NOT NULL,
+            account_type TEXT NOT NULL CHECK (account_type IN ('ASSET','LIABILITY','EQUITY','REVENUE','EXPENSE')),
+            parent_id INTEGER REFERENCES accounts(id) ON DELETE RESTRICT,
+            is_control INTEGER NOT NULL DEFAULT 0 CHECK (is_control IN (0,1)),
+            is_postable INTEGER NOT NULL DEFAULT 1 CHECK (is_postable IN (0,1)),
+            is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
+            normal_balance TEXT NOT NULL CHECK (normal_balance IN ('DEBIT','CREDIT'))
+        );
+
+        CREATE TABLE account_mappings (
+            id INTEGER PRIMARY KEY,
+            mapping_key TEXT NOT NULL UNIQUE,
+            account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT
+        );
+
+        CREATE TABLE journal_entries (
+            id INTEGER PRIMARY KEY,
+            entry_no TEXT NOT NULL UNIQUE,
+            entry_date TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_id INTEGER NOT NULL,
+            entry_kind TEXT NOT NULL CHECK (entry_kind IN ('POSTING','REVERSAL','ADJUSTMENT')),
+            description TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'POSTED' CHECK (status IN ('POSTED','REVERSED')),
+            posted_at TEXT NOT NULL,
+            posted_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            reversal_of_id INTEGER REFERENCES journal_entries(id) ON DELETE RESTRICT,
+            reversed_by_id INTEGER REFERENCES journal_entries(id) ON DELETE RESTRICT,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (source_type, source_id, entry_kind)
+        );
+
+        CREATE TABLE journal_lines (
+            id INTEGER PRIMARY KEY,
+            journal_entry_id INTEGER NOT NULL REFERENCES journal_entries(id) ON DELETE RESTRICT,
+            line_no INTEGER NOT NULL,
+            account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+            debit_piastres INTEGER NOT NULL DEFAULT 0 CHECK (debit_piastres >= 0),
+            credit_piastres INTEGER NOT NULL DEFAULT 0 CHECK (credit_piastres >= 0),
+            party_type TEXT,
+            party_id INTEGER,
+            project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+            description TEXT,
+            source_line_id INTEGER,
+            CHECK ((debit_piastres > 0) <> (credit_piastres > 0)),
+            UNIQUE (journal_entry_id, line_no)
+        );
+        CREATE INDEX ix_journal_lines_account ON journal_lines(account_id, journal_entry_id);
+
+        CREATE TABLE financial_accounts (
+            id INTEGER PRIMARY KEY,
+            code TEXT NOT NULL UNIQUE,
+            name_ar TEXT NOT NULL,
+            account_type TEXT NOT NULL CHECK (account_type IN ('CASH','BANK','WALLET','OTHER')),
+            gl_account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+            is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
+            opening_date TEXT
+        );
+
+        CREATE TRIGGER journal_entries_no_delete
+        BEFORE DELETE ON journal_entries
+        WHEN OLD.status = 'POSTED'
+        BEGIN
+            SELECT RAISE(ABORT, 'posted journal entry is immutable');
+        END;
+
+        CREATE TRIGGER journal_entries_no_edit
+        BEFORE UPDATE ON journal_entries
+        WHEN OLD.status = 'POSTED' AND NEW.status = 'POSTED'
+        BEGIN
+            SELECT RAISE(ABORT, 'posted journal entry is immutable');
+        END;
+
+        CREATE TRIGGER journal_lines_no_update
+        BEFORE UPDATE ON journal_lines
+        WHEN (SELECT status FROM journal_entries WHERE id = OLD.journal_entry_id) = 'POSTED'
+        BEGIN
+            SELECT RAISE(ABORT, 'posted journal line is immutable');
+        END;
+
+        CREATE TRIGGER journal_lines_no_delete
+        BEFORE DELETE ON journal_lines
+        WHEN (SELECT status FROM journal_entries WHERE id = OLD.journal_entry_id) = 'POSTED'
+        BEGIN
+            SELECT RAISE(ABORT, 'posted journal line is immutable');
+        END;
+        """,
+    ),
 ]
 
 

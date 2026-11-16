@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timezone
 
 from .db import Database
@@ -91,14 +92,15 @@ class AccountingService:
         posted_by: int | None = None,
         entry_kind: str = "POSTING",
         reversal_of_id: int | None = None,
+        conn=None,
     ) -> int:
         if not lines:
             raise ValueError("journal must have lines")
         normalized = []
         total_debit = total_credit = 0
-        with self.db.connect() as conn:
+        with self.db.connect() as read_conn:
             for index, line in enumerate(lines, start=1):
-                account = conn.execute("SELECT * FROM accounts WHERE code=?", (line["account_code"],)).fetchone()
+                account = read_conn.execute("SELECT * FROM accounts WHERE code=?", (line["account_code"],)).fetchone()
                 if account is None:
                     raise ValueError(f"unknown account: {line['account_code']}")
                 if not account["is_postable"] or not account["is_active"]:
@@ -113,23 +115,23 @@ class AccountingService:
         if total_debit != total_credit or total_debit <= 0:
             raise ValueError("journal is not balanced")
 
-        with self.db.transaction() as conn:
-            existing = conn.execute(
+        with (nullcontext(conn) if conn is not None else self.db.transaction()) as tx:
+            existing = tx.execute(
                 "SELECT id FROM journal_entries WHERE source_type=? AND source_id=? AND entry_kind=?",
                 (source_type, source_id, entry_kind),
             ).fetchone()
             if existing:
                 raise ValueError("journal already exists for this source")
-            entry_no = next_number(conn, "JOURNAL_ENTRY", int(entry_date[:4]), "JV-")
+            entry_no = next_number(tx, "JOURNAL_ENTRY", int(entry_date[:4]), "JV-")
             idem = f"{source_type}:{source_id}:{entry_kind}"
-            cur = conn.execute(
+            cur = tx.execute(
                 "INSERT INTO journal_entries(entry_no,entry_date,source_type,source_id,entry_kind,description,posted_at,posted_by,reversal_of_id,idempotency_key) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (entry_no, entry_date, source_type, source_id, entry_kind, description, _now(), posted_by, reversal_of_id, idem),
             )
             entry_id = int(cur.lastrowid)
             for account_id, line_no, debit, credit, line in normalized:
-                conn.execute(
+                tx.execute(
                     "INSERT INTO journal_lines(journal_entry_id,line_no,account_id,debit_piastres,credit_piastres,party_type,party_id,project_id,description,source_line_id) "
                     "VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (

@@ -282,6 +282,197 @@ MIGRATIONS: list[Migration] = [
         END;
         """,
     ),
+    Migration(
+        4,
+        "purchasing_inventory",
+        """
+        CREATE TABLE purchase_invoices (
+            id INTEGER PRIMARY KEY,
+            document_no TEXT NOT NULL UNIQUE,
+            supplier_id INTEGER NOT NULL REFERENCES suppliers(id) ON DELETE RESTRICT,
+            supplier_invoice_no TEXT,
+            invoice_date TEXT NOT NULL,
+            due_date TEXT,
+            payment_type TEXT NOT NULL CHECK (payment_type IN ('CASH','CREDIT')),
+            financial_account_id INTEGER REFERENCES financial_accounts(id) ON DELETE RESTRICT,
+            status TEXT NOT NULL DEFAULT 'DRAFT' CHECK (status IN ('DRAFT','POSTED','CANCELLED')),
+            subtotal_piastres INTEGER NOT NULL DEFAULT 0 CHECK (subtotal_piastres >= 0),
+            expense_piastres INTEGER NOT NULL DEFAULT 0 CHECK (expense_piastres >= 0),
+            total_piastres INTEGER NOT NULL DEFAULT 0 CHECK (total_piastres >= 0),
+            posted_at TEXT,
+            journal_entry_id INTEGER UNIQUE REFERENCES journal_entries(id) ON DELETE RESTRICT,
+            created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE purchase_invoice_lines (
+            id INTEGER PRIMARY KEY,
+            purchase_invoice_id INTEGER NOT NULL REFERENCES purchase_invoices(id) ON DELETE RESTRICT,
+            line_no INTEGER NOT NULL,
+            product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+            unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE RESTRICT,
+            quantity_micros INTEGER NOT NULL CHECK (quantity_micros > 0),
+            base_qty_micros INTEGER NOT NULL CHECK (base_qty_micros > 0),
+            unit_price_micros INTEGER NOT NULL CHECK (unit_price_micros >= 0),
+            supplier_line_total_piastres INTEGER NOT NULL CHECK (supplier_line_total_piastres >= 0),
+            net_piastres INTEGER NOT NULL CHECK (net_piastres >= 0),
+            tracking_mode TEXT NOT NULL CHECK (tracking_mode IN ('LOT','REEL')),
+            UNIQUE (purchase_invoice_id, line_no)
+        );
+
+        CREATE TABLE purchase_reel_inputs (
+            id INTEGER PRIMARY KEY,
+            purchase_invoice_line_id INTEGER NOT NULL REFERENCES purchase_invoice_lines(id) ON DELETE RESTRICT,
+            seq INTEGER NOT NULL,
+            length_micros INTEGER NOT NULL CHECK (length_micros > 0),
+            UNIQUE (purchase_invoice_line_id, seq)
+        );
+
+        CREATE TABLE purchase_lots (
+            id INTEGER PRIMARY KEY,
+            lot_no TEXT NOT NULL UNIQUE,
+            purchase_invoice_line_id INTEGER REFERENCES purchase_invoice_lines(id) ON DELETE RESTRICT,
+            source_type TEXT NOT NULL DEFAULT 'PURCHASE' CHECK (source_type IN ('PURCHASE','OPENING','RETURN','ADJUSTMENT')),
+            product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+            warehouse_id INTEGER NOT NULL DEFAULT 1,
+            supplier_id INTEGER REFERENCES suppliers(id) ON DELETE RESTRICT,
+            tracking_mode TEXT NOT NULL CHECK (tracking_mode IN ('LOT','REEL')),
+            received_at TEXT NOT NULL,
+            original_qty_micros INTEGER NOT NULL CHECK (original_qty_micros > 0),
+            original_supplier_cost_piastres INTEGER NOT NULL CHECK (original_supplier_cost_piastres >= 0),
+            original_landed_cost_piastres INTEGER NOT NULL CHECK (original_landed_cost_piastres >= 0),
+            status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN','EXHAUSTED','RETURNED_TO_SUPPLIER')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE reels (
+            id INTEGER PRIMARY KEY,
+            reel_no TEXT NOT NULL UNIQUE,
+            lot_id INTEGER NOT NULL REFERENCES purchase_lots(id) ON DELETE RESTRICT,
+            product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+            original_length_micros INTEGER NOT NULL CHECK (original_length_micros > 0),
+            supplier_cost_piastres INTEGER NOT NULL CHECK (supplier_cost_piastres >= 0),
+            allocated_expense_piastres INTEGER NOT NULL CHECK (allocated_expense_piastres >= 0),
+            original_cost_piastres INTEGER NOT NULL CHECK (original_cost_piastres >= 0),
+            status TEXT NOT NULL DEFAULT 'SEALED' CHECK (status IN ('SEALED','OPENED','EMPTY','RETURNED','DAMAGED')),
+            received_at TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE inventory_cost_layers (
+            id INTEGER PRIMARY KEY,
+            lot_id INTEGER NOT NULL REFERENCES purchase_lots(id) ON DELETE RESTRICT,
+            reel_id INTEGER REFERENCES reels(id) ON DELETE RESTRICT,
+            layer_type TEXT NOT NULL CHECK (layer_type IN ('BASE','CUSTOMER_RETURN','ADJUSTMENT_IN')),
+            parent_issue_allocation_id INTEGER,
+            original_qty_micros INTEGER NOT NULL CHECK (original_qty_micros > 0),
+            original_cost_piastres INTEGER NOT NULL CHECK (original_cost_piastres >= 0),
+            position_micros INTEGER NOT NULL DEFAULT 0 CHECK (position_micros >= 0),
+            remaining_qty_micros INTEGER NOT NULL,
+            remaining_cost_piastres INTEGER NOT NULL CHECK (remaining_cost_piastres >= 0),
+            fifo_anchor_at TEXT NOT NULL,
+            fifo_suborder INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN','EXHAUSTED','DAMAGED')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK (position_micros <= original_qty_micros),
+            CHECK (remaining_qty_micros = original_qty_micros - position_micros),
+            CHECK (remaining_cost_piastres <= original_cost_piastres)
+        );
+        CREATE INDEX ix_layers_fifo ON inventory_cost_layers(lot_id, status, fifo_anchor_at, fifo_suborder);
+
+        CREATE TABLE stock_movements (
+            id INTEGER PRIMARY KEY,
+            movement_no TEXT NOT NULL UNIQUE,
+            movement_type TEXT NOT NULL CHECK (movement_type IN ('RECEIPT','SALE_ISSUE','SALE_RETURN_IN','PURCHASE_RETURN','DAMAGE','ADJUSTMENT')),
+            product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+            warehouse_id INTEGER NOT NULL DEFAULT 1,
+            lot_id INTEGER REFERENCES purchase_lots(id) ON DELETE RESTRICT,
+            reel_id INTEGER REFERENCES reels(id) ON DELETE RESTRICT,
+            quantity_micros INTEGER NOT NULL CHECK (quantity_micros > 0),
+            cost_piastres INTEGER NOT NULL CHECK (cost_piastres >= 0),
+            direction TEXT NOT NULL CHECK (direction IN ('IN','OUT')),
+            source_type TEXT NOT NULL,
+            source_id INTEGER NOT NULL,
+            source_line_id INTEGER,
+            occurred_at TEXT NOT NULL,
+            posted_at TEXT NOT NULL,
+            created_by INTEGER REFERENCES users(id) ON DELETE SET NULL
+        );
+
+        CREATE TABLE lot_allocations (
+            id INTEGER PRIMARY KEY,
+            stock_movement_id INTEGER NOT NULL REFERENCES stock_movements(id) ON DELETE RESTRICT,
+            cost_layer_id INTEGER NOT NULL REFERENCES inventory_cost_layers(id) ON DELETE RESTRICT,
+            lot_id INTEGER NOT NULL REFERENCES purchase_lots(id) ON DELETE RESTRICT,
+            sales_line_id INTEGER,
+            sales_return_line_id INTEGER,
+            purchase_return_line_id INTEGER,
+            allocation_role TEXT NOT NULL CHECK (allocation_role IN ('RECEIPT','SALE_ISSUE','SALE_RETURN','DAMAGE','PURCHASE_RETURN','ADJUSTMENT_IN','ADJUSTMENT_OUT')),
+            quantity_micros INTEGER NOT NULL CHECK (quantity_micros > 0),
+            cost_piastres INTEGER NOT NULL CHECK (cost_piastres >= 0),
+            direction TEXT NOT NULL CHECK (direction IN ('IN','OUT')),
+            layer_position_start_micros INTEGER,
+            layer_position_end_micros INTEGER,
+            source_issue_allocation_id INTEGER,
+            created_layer_id INTEGER REFERENCES inventory_cost_layers(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (stock_movement_id, cost_layer_id, allocation_role)
+        );
+
+        CREATE TABLE reel_allocations (
+            id INTEGER PRIMARY KEY,
+            stock_movement_id INTEGER NOT NULL REFERENCES stock_movements(id) ON DELETE RESTRICT,
+            cost_layer_id INTEGER NOT NULL REFERENCES inventory_cost_layers(id) ON DELETE RESTRICT,
+            reel_id INTEGER NOT NULL REFERENCES reels(id) ON DELETE RESTRICT,
+            sales_line_id INTEGER,
+            sales_return_line_id INTEGER,
+            purchase_return_line_id INTEGER,
+            allocation_role TEXT NOT NULL CHECK (allocation_role IN ('RECEIPT','SALE_ISSUE','SALE_RETURN','DAMAGE','PURCHASE_RETURN','ADJUSTMENT_IN','ADJUSTMENT_OUT')),
+            quantity_micros INTEGER NOT NULL CHECK (quantity_micros > 0),
+            cost_piastres INTEGER NOT NULL CHECK (cost_piastres >= 0),
+            direction TEXT NOT NULL CHECK (direction IN ('IN','OUT')),
+            layer_position_start_micros INTEGER,
+            layer_position_end_micros INTEGER,
+            source_issue_allocation_id INTEGER,
+            created_layer_id INTEGER REFERENCES inventory_cost_layers(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (stock_movement_id, cost_layer_id, allocation_role)
+        );
+
+        CREATE TABLE purchase_returns (
+            id INTEGER PRIMARY KEY,
+            document_no TEXT NOT NULL UNIQUE,
+            purchase_invoice_id INTEGER NOT NULL REFERENCES purchase_invoices(id) ON DELETE RESTRICT,
+            supplier_id INTEGER NOT NULL REFERENCES suppliers(id) ON DELETE RESTRICT,
+            return_date TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'DRAFT' CHECK (status IN ('DRAFT','POSTED','CANCELLED')),
+            total_piastres INTEGER NOT NULL DEFAULT 0 CHECK (total_piastres >= 0),
+            journal_entry_id INTEGER UNIQUE REFERENCES journal_entries(id) ON DELETE RESTRICT,
+            reason TEXT,
+            posted_at TEXT
+        );
+
+        CREATE TABLE purchase_return_lines (
+            id INTEGER PRIMARY KEY,
+            purchase_return_id INTEGER NOT NULL REFERENCES purchase_returns(id) ON DELETE RESTRICT,
+            purchase_invoice_line_id INTEGER NOT NULL REFERENCES purchase_invoice_lines(id) ON DELETE RESTRICT,
+            lot_id INTEGER NOT NULL REFERENCES purchase_lots(id) ON DELETE RESTRICT,
+            reel_id INTEGER REFERENCES reels(id) ON DELETE RESTRICT,
+            quantity_micros INTEGER NOT NULL CHECK (quantity_micros > 0),
+            cost_piastres INTEGER NOT NULL DEFAULT 0 CHECK (cost_piastres >= 0)
+        );
+
+        CREATE TRIGGER purchase_invoices_no_edit
+        BEFORE UPDATE ON purchase_invoices
+        WHEN OLD.status = 'POSTED' AND NEW.status = 'POSTED'
+        BEGIN SELECT RAISE(ABORT, 'posted purchase invoice is immutable'); END;
+
+        CREATE TRIGGER purchase_invoices_no_delete
+        BEFORE DELETE ON purchase_invoices
+        WHEN OLD.status = 'POSTED'
+        BEGIN SELECT RAISE(ABORT, 'posted purchase invoice is immutable'); END;
+        """,
+    ),
 ]
 
 

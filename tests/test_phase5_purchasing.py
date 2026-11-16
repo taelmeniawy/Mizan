@@ -92,6 +92,28 @@ def test_T_INV_009_reel_cut(shop):
     assert shop["purchasing"].reel_remaining(reel) == (62_500_000, 187_500)
 
 
+def test_T_INV_010_and_011_reel_split_and_full_cut(shop):
+    invoice = _invoice(shop, shop["reel_product"], 100_000_000, 30_000_000, reel_lengths=[100_000_000])
+    shop["purchasing"].post_invoice(invoice)
+    reel = shop["db"].scalar("SELECT id FROM reels LIMIT 1")
+    assert shop["purchasing"].cut_reel(reel, 10_000_000)["cost"] == 30_000
+    assert shop["purchasing"].cut_reel(reel, 27_500_000)["cost"] == 82_500
+    assert shop["purchasing"].reel_remaining(reel) == (62_500_000, 187_500)
+    assert shop["purchasing"].cut_reel(reel, 62_500_000)["cost"] == 187_500
+    assert shop["purchasing"].reel_remaining(reel) == (0, 0)
+    assert shop["db"].scalar("SELECT status FROM reels WHERE id=?", (reel,)) == "EMPTY"
+
+
+def test_T_DMG_004_full_reel_damage(shop):
+    invoice = _invoice(shop, shop["reel_product"], 100_000_000, 30_000_000, reel_lengths=[100_000_000])
+    shop["purchasing"].post_invoice(invoice)
+    reel = shop["db"].scalar("SELECT id FROM reels LIMIT 1")
+    result = shop["purchasing"].damage_reel(reel, 100_000_000)
+    assert result["cost"] == 300_000
+    assert shop["purchasing"].reel_remaining(reel) == (0, 0)
+    assert shop["db"].scalar("SELECT status FROM reels WHERE id=?", (reel,)) == "DAMAGED"
+
+
 def test_T_SUP_001_purchase_return(shop):
     invoice = _invoice(shop, shop["lot_product"], 100_000_000, 20_000_000)
     shop["purchasing"].post_invoice(invoice)
@@ -114,6 +136,61 @@ def test_T_DMG_001_damage(shop):
     assert result["cost"] == 20000
     assert shop["purchasing"].lot_remaining(lot) == (90_000_000, 180000)
     assert shop["accounting"].account_balance("5020") == 20000
+
+
+def test_T_DMG_002_full_damage(shop):
+    invoice = _invoice(shop, shop["lot_product"], 100_000_000, 20_000_000)
+    shop["purchasing"].post_invoice(invoice)
+    lot = shop["db"].scalar("SELECT id FROM purchase_lots WHERE purchase_invoice_line_id=1")
+    result = shop["purchasing"].damage_lot(lot, 100_000_000)
+    assert result["cost"] == 200_000
+    assert shop["purchasing"].lot_remaining(lot) == (0, 0)
+    assert shop["db"].scalar("SELECT status FROM purchase_lots WHERE id=?", (lot,)) == "EXHAUSTED"
+
+
+def test_T_DMG_003_reel_damage(shop):
+    invoice = _invoice(shop, shop["reel_product"], 100_000_000, 30_000_000, reel_lengths=[100_000_000])
+    shop["purchasing"].post_invoice(invoice)
+    reel = shop["db"].scalar("SELECT id FROM reels LIMIT 1")
+    result = shop["purchasing"].damage_reel(reel, 10_000_000)
+    assert result["cost"] == 30_000
+    assert shop["purchasing"].reel_remaining(reel) == (90_000_000, 270_000)
+
+
+def test_T_SUP_002_return_after_partial_sale(shop):
+    invoice = _invoice(shop, shop["lot_product"], 100_000_000, 20_000_000)
+    shop["purchasing"].post_invoice(invoice)
+    lot = shop["db"].scalar("SELECT id FROM purchase_lots WHERE purchase_invoice_line_id=1")
+    line = shop["db"].scalar("SELECT id FROM purchase_invoice_lines WHERE purchase_invoice_id=?", (invoice,))
+    shop["purchasing"].issue_fifo(shop["lot_product"], 20_000_000)
+    ret = shop["purchasing"].create_purchase_return(invoice, [
+        {"purchase_invoice_line_id": line, "lot_id": lot, "quantity_micros": 10_000_000}
+    ], "2026-11-13")
+    result = shop["purchasing"].post_purchase_return(ret)
+    assert result["total"] == 20_000
+    assert shop["purchasing"].lot_remaining(lot) == (70_000_000, 140_000)
+
+
+def test_T_COST_004_conservation(shop):
+    invoice = _invoice(shop, shop["lot_product"], 100_000_000, 20_000_000)
+    shop["purchasing"].post_invoice(invoice)
+    lot = shop["db"].scalar("SELECT id FROM purchase_lots WHERE purchase_invoice_line_id=1")
+    line = shop["db"].scalar("SELECT id FROM purchase_invoice_lines WHERE purchase_invoice_id=?", (invoice,))
+    shop["purchasing"].issue_fifo(shop["lot_product"], 20_000_000)
+    shop["purchasing"].damage_lot(lot, 10_000_000)
+    ret = shop["purchasing"].create_purchase_return(invoice, [
+        {"purchase_invoice_line_id": line, "lot_id": lot, "quantity_micros": 10_000_000}
+    ], "2026-11-14")
+    shop["purchasing"].post_purchase_return(ret)
+    remaining = shop["purchasing"].lot_remaining(lot)
+    assert remaining == (60_000_000, 120_000)
+    assert remaining[0] + 20_000_000 + 10_000_000 + 10_000_000 == 100_000_000
+    assert remaining[1] + 40_000 + 20_000 + 20_000 == 200_000
+
+
+def test_T_COST_003_and_005_return_and_split_invariance():
+    assert return_cost(2333, 2_000_000, 0, 2_000_000) == 2333
+    assert outflow_cost(2_000_000, 2333, 0, 1_000_000) + outflow_cost(2_000_000, 2333, 1_000_000, 1_000_000) == 2333
 
 
 def test_T_COST_001_returns_and_micro_issue():

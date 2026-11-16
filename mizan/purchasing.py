@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from .accounting import AccountingService
+from .auth import PermissionService
 from .db import Database
 from .lcp import allocate_largest_remainder, outflow_cost, remaining_cost
 from .numbering import next_number
@@ -127,6 +128,8 @@ class PurchasingService:
         return int(cur.lastrowid)
 
     def post_invoice(self, invoice_id: int, actor_id: int | None = None) -> dict:
+        if actor_id is not None:
+            PermissionService(self.db).require(actor_id, "post_purchases")
         with self.db.transaction() as conn:
             invoice = conn.execute("SELECT * FROM purchase_invoices WHERE id=?", (invoice_id,)).fetchone()
             if invoice is None or invoice["status"] != "DRAFT":
@@ -357,6 +360,8 @@ class PurchasingService:
             return {"movement_id": movement_id, "cost": total_cost, "quantity": length}
 
     def damage_lot(self, lot_id: int, quantity: int, actor_id: int | None = None, occurred_at: str | None = None) -> dict:
+        if actor_id is not None:
+            PermissionService(self.db).require(actor_id, "manage_inventory")
         occurred_at = occurred_at or _now()[:10]
         with self.db.transaction() as conn:
             lot = conn.execute("SELECT * FROM purchase_lots WHERE id=?", (lot_id,)).fetchone()
@@ -382,6 +387,42 @@ class PurchasingService:
             self._refresh_lot_status(conn, lot_id)
             return {"movement_id": movement_id, "cost": total_cost, "journal_id": journal}
 
+    def damage_reel(self, reel_id: int, length: int, actor_id: int | None = None, occurred_at: str | None = None) -> dict:
+        if actor_id is not None:
+            PermissionService(self.db).require(actor_id, "manage_inventory")
+        occurred_at = occurred_at or _now()[:10]
+        with self.db.transaction() as conn:
+            reel = conn.execute("SELECT * FROM reels WHERE id=?", (reel_id,)).fetchone()
+            if reel is None:
+                raise InventoryError("reel not found")
+            parts = self._consume(conn, reel["lot_id"], length, reel_id)
+            total_cost = sum(part["cost"] for part in parts)
+            movement_id = self._create_movement(
+                conn, "DAMAGE", reel["product_id"], reel["lot_id"], reel_id, length, total_cost, "OUT",
+                "DAMAGE", reel_id, occurred_at, actor_id,
+            )
+            for part in parts:
+                conn.execute(
+                    "INSERT INTO reel_allocations(stock_movement_id,cost_layer_id,reel_id,allocation_role,quantity_micros,cost_piastres,direction,layer_position_start_micros,layer_position_end_micros) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (movement_id, part["layer"]["id"], reel_id, "DAMAGE", part["quantity"], part["cost"], "OUT", part["start"], part["end"]),
+                )
+            journal = self.accounting.post_journal(
+                occurred_at, "DAMAGE", movement_id,
+                [{"account_code": "5020", "debit": total_cost}, {"account_code": "1200", "credit": total_cost}],
+                description="تلف بكرة", posted_by=actor_id, conn=conn,
+            )
+            remaining = conn.execute(
+                "SELECT COALESCE(SUM(remaining_qty_micros),0) FROM inventory_cost_layers WHERE reel_id=?",
+                (reel_id,),
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE reels SET status=?,version=version+1 WHERE id=?",
+                ("DAMAGED" if remaining == 0 else "OPENED", reel_id),
+            )
+            self._refresh_lot_status(conn, reel["lot_id"])
+            return {"movement_id": movement_id, "cost": total_cost, "journal_id": journal}
+
     def create_purchase_return(self, invoice_id: int, lines: list[dict], return_date: str, reason: str | None = None) -> int:
         with self.db.transaction() as conn:
             invoice = conn.execute("SELECT * FROM purchase_invoices WHERE id=? AND status='POSTED'", (invoice_id,)).fetchone()
@@ -402,6 +443,8 @@ class PurchasingService:
             return return_id
 
     def post_purchase_return(self, return_id: int, actor_id: int | None = None) -> dict:
+        if actor_id is not None:
+            PermissionService(self.db).require(actor_id, "post_purchase_return")
         with self.db.transaction() as conn:
             ret = conn.execute("SELECT * FROM purchase_returns WHERE id=? AND status='DRAFT'", (return_id,)).fetchone()
             if ret is None:

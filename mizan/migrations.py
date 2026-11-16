@@ -89,6 +89,103 @@ MIGRATIONS: list[Migration] = [
             ON audit_events(entity_type, entity_id, occurred_at);
         """,
     ),
+    Migration(
+        2,
+        "master_data",
+        """
+        CREATE TABLE units (
+            id INTEGER PRIMARY KEY,
+            code TEXT NOT NULL UNIQUE,
+            name_ar TEXT NOT NULL,
+            allows_fraction INTEGER NOT NULL DEFAULT 0 CHECK (allows_fraction IN (0,1)),
+            is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1))
+        );
+
+        CREATE TABLE products (
+            id INTEGER PRIMARY KEY,
+            code TEXT NOT NULL UNIQUE,
+            name_ar TEXT NOT NULL,
+            base_unit_id INTEGER NOT NULL REFERENCES units(id),
+            tracking_mode TEXT NOT NULL CHECK (tracking_mode IN ('LOT','REEL')),
+            is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
+            reorder_level_micros INTEGER NOT NULL DEFAULT 0 CHECK (reorder_level_micros >= 0),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE product_unit_conversions (
+            id INTEGER PRIMARY KEY,
+            product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+            unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE RESTRICT,
+            factor_num INTEGER NOT NULL CHECK (factor_num > 0),
+            factor_den INTEGER NOT NULL CHECK (factor_den > 0),
+            UNIQUE (product_id, unit_id)
+        );
+
+        CREATE TABLE customers (
+            id INTEGER PRIMARY KEY,
+            code TEXT NOT NULL UNIQUE,
+            name_ar TEXT NOT NULL,
+            customer_type TEXT NOT NULL DEFAULT 'RETAIL' CHECK (customer_type IN ('RETAIL','WHOLESALE','CONTRACTOR')),
+            phone TEXT,
+            address TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1))
+        );
+
+        CREATE TABLE suppliers (
+            id INTEGER PRIMARY KEY,
+            code TEXT NOT NULL UNIQUE,
+            name_ar TEXT NOT NULL,
+            phone TEXT,
+            address TEXT,
+            tax_id TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1))
+        );
+
+        CREATE TABLE projects (
+            id INTEGER PRIMARY KEY,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+            code TEXT NOT NULL,
+            name_ar TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'OPEN',
+            start_date TEXT,
+            UNIQUE (customer_id, code)
+        );
+
+        CREATE TABLE price_lists (
+            id INTEGER PRIMARY KEY,
+            code TEXT NOT NULL UNIQUE,
+            name_ar TEXT NOT NULL,
+            list_type TEXT NOT NULL DEFAULT 'GENERAL',
+            is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1))
+        );
+
+        CREATE TABLE price_list_items (
+            id INTEGER PRIMARY KEY,
+            price_list_id INTEGER NOT NULL REFERENCES price_lists(id) ON DELETE CASCADE,
+            product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+            unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE RESTRICT,
+            price_micros INTEGER NOT NULL CHECK (price_micros >= 0),
+            UNIQUE (price_list_id, product_id, unit_id)
+        );
+
+        CREATE TABLE customer_prices (
+            id INTEGER PRIMARY KEY,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+            product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+            unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE RESTRICT,
+            price_micros INTEGER NOT NULL CHECK (price_micros >= 0),
+            UNIQUE (customer_id, product_id, unit_id)
+        );
+
+        CREATE TABLE product_default_prices (
+            id INTEGER PRIMARY KEY,
+            product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+            unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE RESTRICT,
+            price_micros INTEGER NOT NULL CHECK (price_micros >= 0),
+            UNIQUE (product_id, unit_id)
+        );
+        """,
+    ),
 ]
 
 

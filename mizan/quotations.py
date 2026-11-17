@@ -14,7 +14,7 @@ from datetime import date, datetime, timezone
 
 from .auth import PermissionDenied, PermissionService
 from .db import Database
-from .documents import DocumentService
+from .documents import DocumentError, DocumentService
 from .inventory import available_stock
 from .lcp import allocate_largest_remainder, line_total
 from .numbering import next_number
@@ -495,7 +495,11 @@ class QuotationService:
         return row
 
     def issue_quotation(self, quotation_id: int, *, official_export_id: int | None = None,
-                        actor_id: int | None = None) -> None:
+                        official_export: dict | None = None,
+                        expected_snapshot: dict | None = None,
+                        actor_id: int | None = None) -> int:
+        if official_export_id is not None and official_export is not None:
+            raise QuotationError("provide official_export_id or official_export, not both")
         self._require(actor_id, "issue_quotation")
         with self.db.transaction() as conn:
             row = _quotation_row(conn, quotation_id)
@@ -515,7 +519,30 @@ class QuotationService:
                     row["issue_date"], "issue_date"
                 ):
                     raise QuotationError("valid_until cannot be before issue_date")
-            export = self._official_export(conn, quotation_id, official_export_id)
+            if official_export is not None:
+                try:
+                    export_id = self.documents.record_export_in_conn(
+                        conn,
+                        document_type="QUOTATION",
+                        document_id=quotation_id,
+                        export_type="PDF",
+                        relative_path=official_export["relative_path"],
+                        sha256=official_export["sha256"],
+                        file_size=int(official_export["file_size"]),
+                        template_version=official_export["template_version"],
+                        renderer_version=official_export["renderer_version"],
+                        generated_by=official_export.get("generated_by", actor_id),
+                        generated_at=official_export.get("generated_at"),
+                        is_official=True,
+                    )
+                except (DocumentError, KeyError) as exc:
+                    raise QuotationError(f"cannot register official export: {exc}") from exc
+                export = conn.execute(
+                    "SELECT * FROM document_exports WHERE id=?", (export_id,)
+                ).fetchone()
+            else:
+                export = self._official_export(conn, quotation_id, official_export_id)
+                export_id = int(export["id"])
 
             prior = conn.execute(
                 "SELECT * FROM quotations WHERE series_id=? AND version_no<? "
@@ -533,20 +560,33 @@ class QuotationService:
                 _audit(conn, "QUOTATION_SUPERSEDED", previous["id"], actor_id)
 
             snapshot = self._build_snapshot(conn, row, export)
+            if expected_snapshot is not None:
+                rendered_content = {
+                    key: value for key, value in snapshot.items()
+                    if key != "official_export"
+                }
+                if json.dumps(rendered_content, ensure_ascii=False, sort_keys=True) != json.dumps(
+                    expected_snapshot, ensure_ascii=False, sort_keys=True
+                ):
+                    raise QuotationError(
+                        "quotation changed while the official PDF was being rendered; "
+                        "retry the issue from the current draft"
+                    )
             self.documents.create_snapshot(
                 document_type="QUOTATION", document_id=quotation_id,
                 snapshot=snapshot, conn=conn,
             )
             conn.execute(
                 "UPDATE quotations SET status='ISSUED',issued_at=?,official_export_id=? WHERE id=?",
-                (_now(), official_export_id, quotation_id),
+                (_now(), export_id, quotation_id),
             )
             _insert_history(
                 conn, quotation_id, "DRAFT", "ISSUED", None, actor_id,
-                {"event": "ISSUED", "official_export_id": official_export_id,
+                {"event": "ISSUED", "official_export_id": export_id,
                  "sha256": export["sha256"]},
             )
             _audit(conn, "QUOTATION_ISSUED", quotation_id, actor_id)
+            return export_id
 
     def accept_quotation(self, quotation_id: int, *, note: str | None = None,
                          actor_id: int | None = None) -> None:
@@ -819,7 +859,9 @@ class QuotationService:
     # Snapshots and reads
     # ------------------------------------------------------------------
 
-    def _build_snapshot(self, conn, row, export) -> dict:
+    def _build_snapshot(self, conn, row, export=None, *,
+                        template_version: str | None = None,
+                        renderer_version: str | None = None) -> dict:
         store = conn.execute("SELECT * FROM store_profile WHERE id=1").fetchone()
         customer = conn.execute(
             "SELECT * FROM customers WHERE id=?", (row["customer_id"],)
@@ -856,7 +898,13 @@ class QuotationService:
                 "net_piastres": line["net_piastres"],
                 "project_id": line["project_id"],
             })
-        return {
+        template = (export["template_version"] if export is not None
+                    else template_version)
+        renderer = (export["renderer_version"] if export is not None
+                    else renderer_version)
+        if not template or not renderer:
+            raise QuotationError("template_version and renderer_version are required")
+        snapshot = {
             "document_type": "QUOTATION",
             "document_id": row["id"],
             "document_no": row["document_no"],
@@ -893,16 +941,33 @@ class QuotationService:
             },
             "notes": row["notes"],
             "terms": row["terms"],
-            "template_version": export["template_version"],
-            "renderer_version": export["renderer_version"],
-            "official_export": {
+            "template_version": template,
+            "renderer_version": renderer,
+        }
+        if export is not None:
+            snapshot["official_export"] = {
                 "id": export["id"],
                 "export_type": export["export_type"],
                 "relative_path": export["relative_path"],
                 "sha256": export["sha256"],
                 "file_size": export["file_size"],
-            },
-        }
+            }
+        return snapshot
+
+    def build_snapshot_content(self, quotation_id: int, *,
+                               template_version: str,
+                               renderer_version: str) -> dict:
+        """Build the renderable snapshot content without an export row.
+
+        The renderer uses this content; `issue_quotation` later persists the
+        final snapshot with the official export metadata.
+        """
+        with self.db.connect() as conn:
+            row = _quotation_row(conn, quotation_id)
+            return self._build_snapshot(
+                conn, row, template_version=template_version,
+                renderer_version=renderer_version,
+            )
 
     def get_quotation(self, quotation_id: int) -> dict:
         with self.db.connect() as conn:

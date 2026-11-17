@@ -165,7 +165,7 @@ sequenceDiagram
 ## 8. حدود المستندات والطباعة
 
 - `DocumentService` يستقبل `DocumentRequest` (نوع، بيانات، قالب).
-- `Renderer` (Qt/WPF/آخر) يُنتج PDF/صفحات.
+- `Renderer` (Qt معتمد في ADR-0004 Option B) يُنتج PDF/صفحات.
 - `DocumentStore` يحفظ الملفات خارج DB، ويسجل `document_exports`.
 - `TemplateRegistry` يحمل إصدار القالب.
 - لا تُبنى قوالب الطباعة داخل شاشات المبيعات.

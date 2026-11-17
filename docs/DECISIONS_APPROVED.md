@@ -1,12 +1,12 @@
 # Decisions Approved for Implementation
 
-**Owner approval:** 2026-11-16; OQ-INV-012 and OQ-INV-004 approved 2026-11-17; OQ-QUO-001, OQ-QUO-005, and OQ-DOC-001 approved 2026-11-17 by the owner instruction to adopt their documented recommendations. Documentation remains the spec; this file records implementation decisions only.
+**Owner approval:** 2026-11-16; OQ-INV-012 and OQ-INV-004 approved 2026-11-17; OQ-QUO-001, OQ-QUO-005, and OQ-DOC-001 approved 2026-11-17; ADR-0004 Option B (Qt `QTextDocument` + `QTextTable` + custom paginator) approved 2026-11-17. Documentation remains the spec; this file records implementation decisions only.
 
 | ID | Decision | Source |
 |---|---|---|
 | ADR-0002 | SQLite/WAL/FKs/BEGIN IMMEDIATE/online backup approach approved for implementation. | ADR-0002 |
 | ADR-0003 | Integer piastres, micros quantities, micro-EGP prices, ROUND_HALF_UP, largest remainder, no float, LCP layers, `R(k)` returns. | ADR-0003 |
-| ADR-0004 | A4-only rendering; UI deferred. A specific A4/PDF engine is **not** approved; ADR-0004 remains PROPOSED / NEEDS APPROVAL. | ADR-0004 |
+| ADR-0004 | **Option B approved:** `QTextDocument` + `QTextTable` with a custom paginator, using Qt (`QPdfWriter`/`QPrinter`) for both PDF and printing. Runtime is `PySide6-Essentials`; no Qt WebEngine and no separate PDF library. T-DOC-005 (licensed/embedded Arabic font), T-DOC-007 (golden image), and T-DOC-009 (real A4 printer) remain open. | Owner approval 2026-11-17 |
 | ADR-0005 | Offline local SQLite; backup/restore policy accepted. | ADR-0005 |
 | ADR-0001 override | Python 3.12 + stdlib sqlite3 + pytest + PySide6 later; own migration runner; no ORM. | Owner override |
 | OQ-ACC-001 | No tax/VAT fields in V1. | OQ recommendation |
@@ -23,7 +23,7 @@
 | OQ-DOC-001 | Document numbers use `{TYPE}-{YYYY}-{NNNNNN}` per type/year from a database sequence; committed numbers are unique and are not reused; gaps are permitted only when a transaction fails. Quotation revisions add `-R{version_no}` to the series base number. | Owner instruction 2026-11-17: adopt documented recommendation |
 | Other OQs | Adopt the "التوصية" in `docs/10_OPEN_QUESTIONS.md`; unresolved implementation details follow the cited ADR. | Owner instruction |
 
-Implementation status: phases 1–6 complete; Phase 7 is in progress/partial. Renderer-independent quotation lifecycle, revisions/root links, conversion to a sales DRAFT with the database duplicate-conversion guard, cancellation/restoration, quotation numbering, document snapshots, and the export metadata model are implemented. Phase 7 is **not** complete: ADR-0004 remains PROPOSED / NEEDS APPROVAL, and PDF text extraction, A4 dimension checks, Arabic shaping/print checks, and a real A4-printer test remain open. Phase 8 must not start until the full Phase 7 gate passes.
+Implementation status: phases 1–6 complete; Phase 7 is in progress/partial. The quotation core and the approved A4 rendering slice are implemented: shared QTextDocument/QTextTable paginator, official quotation PDF export with immutable snapshots/hash, managed file storage, reprint verification, and the shared PDF/printer layout path. Phase 7 is **not** complete: T-DOC-005 (approved/licensed Arabic font) and T-DOC-009 (real A4 printer) remain open, as does T-DOC-007 (golden image after template approval). `OQ-DOC-002` remains open/deferred; no font or logo was bundled. Phase 8 must not start until the full Phase 7 gate passes.
 
 **OQ-DOC-002 remains open/deferred:** logo/font selection is not approved and no font is bundled. It blocks release/document identity, not quotation-core development.
 

@@ -46,17 +46,13 @@ class DocumentService:
         if int(document_id) <= 0:
             raise DocumentError("document_id must be positive")
 
-    def record_export(self, *, document_type: str, document_id: int, export_type: str,
-                      relative_path: str, sha256: str, file_size: int,
-                      template_version: str, renderer_version: str,
-                      generated_by: int, generated_at: str | None = None,
-                      is_official: bool = False) -> int:
-        """Record metadata for a file produced elsewhere (renderer/print layer).
-
-        No file is opened or validated here.  The official-export uniqueness
-        rule is enforced by the partial unique index in the database.
-        """
-        self._validate_document(document_type, document_id)
+    @staticmethod
+    def _normalize_export(*, document_type: str, document_id: int, export_type: str,
+                          relative_path: str, sha256: str, file_size: int,
+                          template_version: str, renderer_version: str,
+                          generated_by: int, generated_at: str | None,
+                          is_official: bool) -> tuple:
+        DocumentService._validate_document(document_type, document_id)
         if export_type not in EXPORT_TYPES:
             raise DocumentError(f"unsupported export type: {export_type}")
         relative_path = (relative_path or "").strip()
@@ -67,17 +63,67 @@ class DocumentService:
             raise DocumentError("file_size cannot be negative")
         if not (template_version or "").strip() or not (renderer_version or "").strip():
             raise DocumentError("template_version and renderer_version are required")
+        if generated_by is None:
+            raise DocumentError("generated_by is required")
+        return (
+            document_type, document_id, export_type, relative_path, sha256,
+            file_size, template_version.strip(), renderer_version.strip(),
+            generated_by, generated_at or _now(), int(bool(is_official)),
+        )
+
+    @staticmethod
+    def _insert_export(conn, values: tuple) -> int:
+        cur = conn.execute(
+            "INSERT INTO document_exports(document_type,document_id,export_type,"
+            "relative_path,sha256,file_size,template_version,renderer_version,"
+            "generated_by,generated_at,is_official) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            values,
+        )
+        return int(cur.lastrowid)
+
+    def record_export(self, *, document_type: str, document_id: int, export_type: str,
+                      relative_path: str, sha256: str, file_size: int,
+                      template_version: str, renderer_version: str,
+                      generated_by: int, generated_at: str | None = None,
+                      is_official: bool = False) -> int:
+        """Record metadata for a file produced elsewhere (renderer/print layer).
+
+        No file is opened or validated here.  The official-export uniqueness
+        rule is enforced by the partial unique index in the database.
+        """
+        values = self._normalize_export(
+            document_type=document_type, document_id=document_id,
+            export_type=export_type, relative_path=relative_path, sha256=sha256,
+            file_size=file_size, template_version=template_version,
+            renderer_version=renderer_version, generated_by=generated_by,
+            generated_at=generated_at, is_official=is_official,
+        )
         try:
             with self.db.transaction() as conn:
-                cur = conn.execute(
-                    "INSERT INTO document_exports(document_type,document_id,export_type,"
-                    "relative_path,sha256,file_size,template_version,renderer_version,"
-                    "generated_by,generated_at,is_official) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (document_type, document_id, export_type, relative_path, sha256,
-                     file_size, template_version.strip(), renderer_version.strip(),
-                     generated_by, generated_at or _now(), int(bool(is_official))),
-                )
-                return int(cur.lastrowid)
+                return self._insert_export(conn, values)
+        except sqlite3.IntegrityError as exc:
+            raise DocumentError(f"cannot record document export: {exc}") from exc
+
+    def record_export_in_conn(self, conn, *, document_type: str, document_id: int,
+                              export_type: str, relative_path: str, sha256: str,
+                              file_size: int, template_version: str,
+                              renderer_version: str, generated_by: int,
+                              generated_at: str | None = None,
+                              is_official: bool = False) -> int:
+        """Insert an export inside an existing transaction.
+
+        The caller owns commit/rollback, which lets an official export and the
+        document's issued status become visible atomically.
+        """
+        values = self._normalize_export(
+            document_type=document_type, document_id=document_id,
+            export_type=export_type, relative_path=relative_path, sha256=sha256,
+            file_size=file_size, template_version=template_version,
+            renderer_version=renderer_version, generated_by=generated_by,
+            generated_at=generated_at, is_official=is_official,
+        )
+        try:
+            return self._insert_export(conn, values)
         except sqlite3.IntegrityError as exc:
             raise DocumentError(f"cannot record document export: {exc}") from exc
 

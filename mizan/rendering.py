@@ -124,9 +124,18 @@ def default_platform_font_family() -> str:
     return load_bundled_fonts()
 
 
-def format_egp(piastres: int) -> str:
+def format_egp_amount(piastres: int) -> str:
+    """Format a piastre amount without the currency suffix.
+
+    Used inside table columns whose header already says ``(EGP)``; unit prices
+    are separate because they are stored in micro-EGP.
+    """
     amount = Decimal(int(piastres)) / Decimal(100)
-    return f"{amount:,.2f} EGP"
+    return f"{amount:,.2f}"
+
+
+def format_egp(piastres: int) -> str:
+    return f"{format_egp_amount(piastres)} EGP"
 
 
 def format_quantity(micros: int) -> str:
@@ -314,9 +323,10 @@ class A4QuotationRenderer:
                 str(row.get("description") or row.get("product_name") or ""),
                 str(row.get("unit_name") or ""),
                 format_quantity(int(row.get("quantity_micros", 0))),
+                # Unit price is micro-EGP; discount/net are piastres.
                 format_unit_price(int(row.get("final_unit_price_micros", 0))),
-                format_unit_price(int(row.get("item_discount_piastres", 0))),
-                format_unit_price(int(row.get("net_piastres", 0))),
+                format_egp_amount(int(row.get("item_discount_piastres", 0))),
+                format_egp_amount(int(row.get("net_piastres", 0))),
             )
             values = tuple(reversed(logical_values))
             for column, value in enumerate(values):

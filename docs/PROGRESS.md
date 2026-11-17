@@ -60,6 +60,15 @@
 - The same snapshot produces the same page plans and the same extracted text on repeat renders.
 - Official export records path, SHA-256, file size, template/renderer versions and `is_official=1`; reprint returns the same file/hash; deleting the file makes reprint and print fail without regeneration.
 - A `QPrinter` PDF-output test confirms the printer path uses the same page composer/layout; it is not a physical-printer test.
+- Per-line table discounts/net amounts use piastres formatting and reconcile with the invoice summary; unit prices remain micro-EGP and quantities remain micro-units.
+
+### Line money formatting fix (2026-11-17)
+
+The review preview showed `0.00`/`0.01` in the table's discount/net columns while the summary was correct. Verified data units before editing: `quotation_lines.final_unit_price_micros` is micro-EGP, while `item_discount_piastres` and `net_piastres` are piastres. The table had passed all three values through `format_unit_price()`, which divides by 1,000,000.
+
+Fix: added `format_egp_amount()` (piastres → two-decimal EGP amount without suffix) and used it for line discount/net cells; `format_unit_price()` remains for unit prices and `format_quantity()` for quantities. The column headers already say `(EGP)`, so table cells stay uncluttered and pagination is unchanged.
+
+Regression tests in `tests/test_phase7_line_amounts.py` cover line 1 net `12.50`, line 2 discount/net `1.00 / 21.13`, lines 21 and 42 net `52.00`, and reconciliation of line discounts/nets with the invoice summary. The re-rendered synthetic review quotation keeps 3 pages with 20/20/5 rows; its line 42 shows `51.00` because that preview row carries a `1.00` discount. The preview remains review-only, not a golden reference.
 
 ### Approved Arabic font — Noto Naskh Arabic (2026-11-17)
 
@@ -100,7 +109,9 @@ Concrete defects found and fixed in this check:
 - Phase 7 rendering tests: `10 passed, 1 skipped` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_rendering.py -q`. The skip is the real A4-printer check because no physical printer is available.
 - Logo snapshot tests: `2 passed` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_logo_snapshot.py -q`.
 - Font package/embedding tests: `3 passed` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_fonts.py -q`.
-- Full suite: **`140 passed, 1 skipped`** — `.venv\Scripts\python.exe -m pytest -q` (run 2026-11-17, project-local `.venv`, Python 3.12.10, pytest 9.2.0, PySide6-Essentials 6.12.0).
+- Line-amount regression tests: `3 passed` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_line_amounts.py -q`.
+- Focused line-amount/rendering/quotation run: `37 passed, 1 skipped` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_line_amounts.py tests/test_phase7_rendering.py tests/test_phase7_quotations.py -q`.
+- Full suite: **`143 passed, 1 skipped`** — `.venv\Scripts\python.exe -m pytest -q` (run 2026-11-17, project-local `.venv`, Python 3.12.10, pytest 9.2.0, PySide6-Essentials 6.12.0).
 - The older quotation issue tests still use a test-double export row; the rendering tests exercise the real renderer/export/PDF path.
 
 ### Implementation notes / deviations

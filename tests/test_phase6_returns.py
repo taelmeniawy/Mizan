@@ -6,6 +6,7 @@ import pytest
 
 from mizan.accounting import AccountingService
 from mizan.auth import PermissionDenied
+from mizan.reporting import ReportingService
 from phase6_support import Shop, build_shop
 
 
@@ -931,6 +932,21 @@ def test_T_RET_013_reel_return_creates_linked_new_reel(shop: Shop):
     assert return_line["lot_id"] == new_lot["id"]
     assert shop.purchasing.reel_remaining(original_reel_id) == (62_500_000, 187_500)
     assert shop.purchasing.reel_remaining(new_reel["id"]) == (10_000_000, 30_000)
+
+    reports = ReportingService(shop.db)
+    received_reel, returned_reel = reports.reel_balances(product_id=shop.reel_product)
+    assert received_reel["remaining_length_micros"] == 62_500_000
+    assert returned_reel["remaining_length_micros"] == 10_000_000
+    assert returned_reel["source_reel_id"] == received_reel["reel_id"]
+    assert returned_reel["source_reel_no"] == received_reel["reel_no"]
+    assert returned_reel["source_issue_allocation_id"] == original_alloc["id"]
+    assert returned_reel["source_document_no"] == shop.db.scalar(
+        "SELECT document_no FROM sales_returns WHERE id=?", (return_id,),
+    )
+    received_lot, returned_lot = reports.fifo_lots(product_id=shop.reel_product)
+    assert received_lot["remaining_cost_piastres"] == 187_500
+    assert returned_lot["remaining_cost_piastres"] == 30_000
+    assert returned_lot["source_document_no"] == returned_reel["source_document_no"]
 
     returnable = shop.sales.returnable_allocations(line_id)
     assert len(returnable) == 1

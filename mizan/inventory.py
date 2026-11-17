@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from .lcp import outflow_cost, remaining_cost
 from .numbering import next_number
+from .periods import require_open_period
 
 
 class InventoryError(ValueError):
@@ -33,6 +34,7 @@ def create_layer(conn, lot_id: int, reel_id: int | None, layer_type: str, qty: i
 def create_movement(conn, movement_type: str, product_id: int, lot_id: int | None, reel_id: int | None,
                     quantity: int, cost: int, direction: str, source_type: str, source_id: int,
                     occurred_at: str, actor_id: int | None, source_line_id: int | None = None) -> int:
+    require_open_period(conn, occurred_at)
     movement_no = next_number(conn, "STOCK_MOVEMENT", int(occurred_at[:4]), "SM-")
     cur = conn.execute(
         "INSERT INTO stock_movements(movement_no,movement_type,product_id,lot_id,reel_id,quantity_micros,"

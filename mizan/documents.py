@@ -165,3 +165,29 @@ class DocumentService:
         if row is None:
             return None
         return json.loads(row["snapshot_json"])
+
+
+def referenced_files(conn, error: type[Exception] = DocumentError) -> dict[str, dict]:
+    """Return the managed files referenced by export rows and document snapshots.
+
+    Both the backup service and the startup check use this function so that the
+    files a backup contains are exactly the files the application expects on
+    disk.  ``error`` lets each caller raise its own exception type.
+    """
+    references: dict[str, dict] = {}
+
+    def add(relative, digest, size):
+        value = {"sha256": digest, "size": size}
+        if relative in references and references[relative] != value:
+            raise error("conflicting document metadata")
+        references[relative] = value
+
+    for relative, digest, size in conn.execute(
+        "SELECT relative_path,sha256,file_size FROM document_exports"
+    ):
+        add(relative, digest, size)
+    for (payload,) in conn.execute("SELECT snapshot_json FROM document_snapshots"):
+        logo = json.loads(payload).get("store", {}).get("logo_asset")
+        if logo:
+            add(logo["relative_path"], logo["sha256"], logo["file_size"])
+    return references

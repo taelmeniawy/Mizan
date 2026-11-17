@@ -58,6 +58,7 @@ PERMISSION_DEFS = {
     "view_profit_reports": ("تقارير الربح", "reports"),
     "backup_database": ("نسخ احتياطي", "system"),
     "restore_database": ("استعادة نسخة", "system"),
+    "view_audit_log": ("عرض سجل التدقيق", "admin"),
 }
 
 ROLE_PERMISSIONS = {

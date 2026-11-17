@@ -2,6 +2,7 @@ import sqlite3
 
 import pytest
 
+from mizan import migrations
 from mizan.db import Database
 from mizan.migrations import MIGRATIONS
 
@@ -13,6 +14,20 @@ def test_migrations_apply_from_empty_and_are_idempotent(db: Database):
     db.initialize()
     with db.connect() as conn:
         assert conn.execute("SELECT COUNT(*) AS n FROM schema_migrations").fetchone()["n"] == len(MIGRATIONS)
+
+
+def test_supplier_payment_migration_preserves_existing_database(tmp_path, monkeypatch):
+    db = Database(tmp_path / "mizan-v7.db")
+    with monkeypatch.context() as patch:
+        patch.setattr(migrations, "MIGRATIONS", [m for m in MIGRATIONS if m.version < 8])
+        db.initialize()
+    with db.transaction() as conn:
+        conn.execute("INSERT INTO store_profile(id,name_ar) VALUES(1,'متجر')")
+
+    db.initialize()
+    assert db.scalar("SELECT name_ar FROM store_profile WHERE id=1") == "متجر"
+    assert db.scalar("SELECT name FROM schema_migrations WHERE version=8") == "supplier_payments"
+    assert db.scalar("SELECT COUNT(*) FROM supplier_payments") == 0
 
 
 def test_sqlite_pragmas_are_enabled(db: Database):

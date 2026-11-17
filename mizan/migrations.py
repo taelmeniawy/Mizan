@@ -1030,6 +1030,150 @@ MIGRATIONS: list[Migration] = [
         BEGIN SELECT RAISE(ABORT, 'sales source quotation is immutable'); END;
         """,
     ),
+    Migration(
+        8,
+        "supplier_payments",
+        """
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE supplier_payments (
+            id INTEGER PRIMARY KEY,
+            document_no TEXT NOT NULL UNIQUE,
+            supplier_id INTEGER NOT NULL REFERENCES suppliers(id) ON DELETE RESTRICT,
+            financial_account_id INTEGER NOT NULL REFERENCES financial_accounts(id) ON DELETE RESTRICT,
+            payment_date TEXT NOT NULL,
+            reference TEXT NOT NULL CHECK (length(trim(reference)) > 0),
+            amount_piastres INTEGER NOT NULL CHECK (amount_piastres > 0),
+            journal_entry_id INTEGER UNIQUE REFERENCES journal_entries(id) ON DELETE RESTRICT,
+            created_by INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (supplier_id, reference)
+        );
+
+        CREATE TABLE supplier_payment_allocations (
+            payment_id INTEGER NOT NULL REFERENCES supplier_payments(id) ON DELETE RESTRICT,
+            purchase_invoice_id INTEGER NOT NULL REFERENCES purchase_invoices(id) ON DELETE RESTRICT,
+            amount_piastres INTEGER NOT NULL CHECK (amount_piastres > 0),
+            PRIMARY KEY (payment_id, purchase_invoice_id)
+        );
+        CREATE INDEX ix_supplier_payment_alloc_invoice
+            ON supplier_payment_allocations(purchase_invoice_id);
+
+        CREATE TRIGGER supplier_payment_no_update_after_post
+        BEFORE UPDATE ON supplier_payments WHEN OLD.journal_entry_id IS NOT NULL
+        BEGIN SELECT RAISE(ABORT, 'posted supplier payment is immutable'); END;
+
+        CREATE TRIGGER supplier_payment_no_delete_after_post
+        BEFORE DELETE ON supplier_payments WHEN OLD.journal_entry_id IS NOT NULL
+        BEGIN SELECT RAISE(ABORT, 'posted supplier payment is immutable'); END;
+
+        CREATE TRIGGER supplier_payment_allocation_no_insert_after_post
+        BEFORE INSERT ON supplier_payment_allocations
+        WHEN (SELECT journal_entry_id FROM supplier_payments WHERE id=NEW.payment_id) IS NOT NULL
+        BEGIN SELECT RAISE(ABORT, 'posted supplier payment allocation is immutable'); END;
+
+        CREATE TRIGGER supplier_payment_allocation_no_update
+        BEFORE UPDATE ON supplier_payment_allocations
+        BEGIN SELECT RAISE(ABORT, 'supplier payment allocation is immutable'); END;
+
+        CREATE TRIGGER supplier_payment_allocation_no_delete
+        BEFORE DELETE ON supplier_payment_allocations
+        BEGIN SELECT RAISE(ABORT, 'supplier payment allocation is immutable'); END;
+        """,
+    ),
+    Migration(
+        9,
+        "accounting_period_locks",
+        """
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE closed_periods (
+            month TEXT PRIMARY KEY CHECK (month GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]'
+                                          AND substr(month,6,2) BETWEEN '01' AND '12')
+        );
+
+        CREATE TRIGGER closed_period_journal_no_insert
+        BEFORE INSERT ON journal_entries
+        WHEN substr(NEW.entry_date,1,7) IN (SELECT month FROM closed_periods)
+        BEGIN SELECT RAISE(ABORT, 'accounting period is closed'); END;
+
+        CREATE TRIGGER closed_period_journal_no_edit
+        BEFORE UPDATE OF id, entry_no, entry_date, source_type, source_id, entry_kind, description,
+                         posted_at, posted_by, reversal_of_id, idempotency_key, created_at ON journal_entries
+        WHEN substr(OLD.entry_date,1,7) IN (SELECT month FROM closed_periods)
+          OR substr(NEW.entry_date,1,7) IN (SELECT month FROM closed_periods)
+        BEGIN SELECT RAISE(ABORT, 'accounting period is closed'); END;
+
+        CREATE TRIGGER closed_period_journal_reversal_link_only
+        BEFORE UPDATE OF status, reversed_by_id ON journal_entries
+        WHEN substr(OLD.entry_date,1,7) IN (SELECT month FROM closed_periods)
+         AND NOT (OLD.status='POSTED' AND NEW.status='REVERSED' AND EXISTS (
+             SELECT 1 FROM journal_entries reversal
+             WHERE reversal.id=NEW.reversed_by_id AND reversal.reversal_of_id=OLD.id
+               AND reversal.entry_kind='REVERSAL' AND reversal.status='POSTED'
+               AND substr(reversal.entry_date,1,10)>=substr(OLD.entry_date,1,10)
+               AND substr(reversal.entry_date,1,7) NOT IN (SELECT month FROM closed_periods)
+         ))
+        BEGIN SELECT RAISE(ABORT, 'accounting period is closed'); END;
+
+        CREATE TRIGGER closed_period_journal_no_delete
+        BEFORE DELETE ON journal_entries
+        WHEN substr(OLD.entry_date,1,7) IN (SELECT month FROM closed_periods)
+        BEGIN SELECT RAISE(ABORT, 'accounting period is closed'); END;
+
+        CREATE TRIGGER closed_period_journal_line_no_insert
+        BEFORE INSERT ON journal_lines
+        WHEN EXISTS (SELECT 1 FROM journal_entries e JOIN closed_periods p ON p.month=substr(e.entry_date,1,7)
+                     WHERE e.id=NEW.journal_entry_id)
+        BEGIN SELECT RAISE(ABORT, 'accounting period is closed'); END;
+
+        CREATE TRIGGER closed_period_journal_line_no_edit
+        BEFORE UPDATE ON journal_lines
+        WHEN EXISTS (SELECT 1 FROM journal_entries e JOIN closed_periods p ON p.month=substr(e.entry_date,1,7)
+                     WHERE e.id IN (OLD.journal_entry_id,NEW.journal_entry_id))
+        BEGIN SELECT RAISE(ABORT, 'accounting period is closed'); END;
+
+        CREATE TRIGGER closed_period_journal_line_no_delete
+        BEFORE DELETE ON journal_lines
+        WHEN EXISTS (SELECT 1 FROM journal_entries e JOIN closed_periods p ON p.month=substr(e.entry_date,1,7)
+                     WHERE e.id=OLD.journal_entry_id)
+        BEGIN SELECT RAISE(ABORT, 'accounting period is closed'); END;
+
+        CREATE TRIGGER closed_period_stock_no_insert
+        BEFORE INSERT ON stock_movements
+        WHEN substr(NEW.occurred_at,1,7) IN (SELECT month FROM closed_periods)
+        BEGIN SELECT RAISE(ABORT, 'accounting period is closed'); END;
+
+        CREATE TRIGGER closed_period_stock_no_edit
+        BEFORE UPDATE ON stock_movements
+        WHEN substr(OLD.occurred_at,1,7) IN (SELECT month FROM closed_periods)
+          OR substr(NEW.occurred_at,1,7) IN (SELECT month FROM closed_periods)
+        BEGIN SELECT RAISE(ABORT, 'accounting period is closed'); END;
+
+        CREATE TRIGGER closed_period_stock_no_delete
+        BEFORE DELETE ON stock_movements
+        WHEN substr(OLD.occurred_at,1,7) IN (SELECT month FROM closed_periods)
+        BEGIN SELECT RAISE(ABORT, 'accounting period is closed'); END;
+        """,
+    ),
+    Migration(
+        10,
+        "audit_log_protection",
+        """
+        CREATE TRIGGER audit_events_no_update
+        BEFORE UPDATE ON audit_events
+        BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
+
+        CREATE TRIGGER audit_events_no_delete
+        BEFORE DELETE ON audit_events
+        BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
+
+        CREATE INDEX IF NOT EXISTS ix_audit_event_type
+            ON audit_events(event_type, occurred_at);
+        CREATE INDEX IF NOT EXISTS ix_audit_actor
+            ON audit_events(actor_user_id, occurred_at);
+        """,
+    ),
 ]
 
 

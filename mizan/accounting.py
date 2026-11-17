@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
-from datetime import datetime, timezone
+from contextlib import closing, nullcontext
+from datetime import date, datetime, timezone
 
 from .db import Database
 from .numbering import next_number
+from .periods import require_open_period
 
 
 CHART = [
@@ -52,6 +53,11 @@ MAPPINGS = {
 
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _validate_cutoff(as_of: str | None) -> None:
+    if as_of is not None and date.fromisoformat(as_of).isoformat() != as_of:
+        raise ValueError("as_of must be a YYYY-MM-DD date")
 
 
 class AccountingService:
@@ -116,6 +122,7 @@ class AccountingService:
             raise ValueError("journal is not balanced")
 
         with (nullcontext(conn) if conn is not None else self.db.transaction()) as tx:
+            require_open_period(tx, entry_date)
             existing = tx.execute(
                 "SELECT id FROM journal_entries WHERE source_type=? AND source_id=? AND entry_kind=?",
                 (source_type, source_id, entry_kind),
@@ -149,8 +156,8 @@ class AccountingService:
                 )
         return entry_id
 
-    def reverse(self, entry_id: int, posted_by: int | None = None) -> int:
-        with self.db.connect() as conn:
+    def reverse(self, entry_id: int, posted_by: int | None = None, *, reversal_date: str | None = None) -> int:
+        with self.db.transaction() as conn:
             original = conn.execute("SELECT * FROM journal_entries WHERE id=?", (entry_id,)).fetchone()
             if original is None:
                 raise ValueError("journal entry not found")
@@ -160,29 +167,26 @@ class AccountingService:
                 "SELECT a.code,l.* FROM journal_lines l JOIN accounts a ON a.id=l.account_id WHERE journal_entry_id=? ORDER BY line_no",
                 (entry_id,),
             ).fetchall()
-        reversal_lines = [
-            {
-                "account_code": row["code"],
-                "debit": row["credit_piastres"],
-                "credit": row["debit_piastres"],
-                "party_type": row["party_type"],
-                "party_id": row["party_id"],
-                "project_id": row["project_id"],
-                "description": f"reversal of {original['entry_no']}",
-            }
-            for row in lines
-        ]
-        new_id = self.post_journal(
-            original["entry_date"],
-            "REVERSAL",
-            entry_id,
-            reversal_lines,
-            description=f"عكس القيد {original['entry_no']}",
-            posted_by=posted_by,
-            entry_kind="REVERSAL",
-            reversal_of_id=entry_id,
-        )
-        with self.db.transaction() as conn:
+            effective_date = original["entry_date"] if reversal_date is None else reversal_date
+            if effective_date[:10] < original["entry_date"][:10]:
+                raise ValueError("reversal date cannot precede the original entry date")
+            reversal_lines = [
+                {
+                    "account_code": row["code"],
+                    "debit": row["credit_piastres"],
+                    "credit": row["debit_piastres"],
+                    "party_type": row["party_type"],
+                    "party_id": row["party_id"],
+                    "project_id": row["project_id"],
+                    "description": f"reversal of {original['entry_no']}",
+                }
+                for row in lines
+            ]
+            new_id = self.post_journal(
+                effective_date, "REVERSAL", entry_id, reversal_lines,
+                description=f"عكس القيد {original['entry_no']}", posted_by=posted_by,
+                entry_kind="REVERSAL", reversal_of_id=entry_id, conn=conn,
+            )
             conn.execute("UPDATE journal_entries SET status='REVERSED', reversed_by_id=? WHERE id=?", (new_id, entry_id))
         return new_id
 
@@ -207,16 +211,124 @@ class AccountingService:
             ).fetchone()
         return int(row["bal"])
 
-    def trial_balance(self) -> list[dict]:
-        with self.db.connect() as conn:
-            rows = conn.execute(
-                "SELECT a.code,a.name_ar,COALESCE(SUM(l.debit_piastres),0) AS debit,"
-                "COALESCE(SUM(l.credit_piastres),0) AS credit "
-                "FROM accounts a LEFT JOIN journal_lines l ON l.account_id=a.id "
-                "LEFT JOIN journal_entries e ON e.id=l.journal_entry_id "
-                "GROUP BY a.id ORDER BY a.code"
+    def trial_balance(self, *, as_of: str | None = None) -> list[dict]:
+        """Return cumulative debit and credit movements through an inclusive date."""
+        return [
+            {field: row[field] for field in ("code", "name_ar", "debit", "credit")}
+            for row in self._trial_balance_rows(as_of)
+        ]
+
+    def _trial_balance_rows(self, as_of: str | None) -> list:
+        _validate_cutoff(as_of)
+        with closing(self.db.connect()) as conn:
+            return conn.execute(
+                "WITH movements AS ("
+                " SELECT l.account_id, SUM(l.debit_piastres) AS debit,"
+                " SUM(l.credit_piastres) AS credit"
+                " FROM journal_lines l JOIN journal_entries e ON e.id=l.journal_entry_id"
+                " WHERE :as_of IS NULL OR substr(e.entry_date,1,10)<=:as_of GROUP BY l.account_id"
+                ") SELECT a.code, a.name_ar, a.account_type, COALESCE(m.debit,0) AS debit,"
+                " COALESCE(m.credit,0) AS credit FROM accounts a"
+                " LEFT JOIN movements m ON m.account_id=a.id ORDER BY a.code",
+                {"as_of": as_of},
             ).fetchall()
-        return [dict(r) for r in rows]
+
+    def balance_sheet(self, *, as_of: str) -> dict:
+        """Return the ledger position including the income still held in nominal accounts."""
+        names = {"ASSET": "assets", "LIABILITY": "liabilities", "EQUITY": "equity"}
+        sections = {name: [] for name in names.values()}
+        totals = dict.fromkeys(sections, 0)
+        unclosed_result = 0
+        for row in self._trial_balance_rows(as_of):
+            debit_balance = row["debit"] - row["credit"]
+            account_type = row["account_type"]
+            if account_type in ("REVENUE", "EXPENSE"):
+                unclosed_result -= debit_balance
+                continue
+            section = names[account_type]
+            amount = debit_balance if account_type == "ASSET" else -debit_balance
+            sections[section].append({"code": row["code"], "name_ar": row["name_ar"], "balance_piastres": amount})
+            totals[section] += amount
+
+        total_equity = totals["equity"] + unclosed_result
+        claims = totals["liabilities"] + total_equity
+        difference = totals["assets"] - claims
+        return {
+            "as_of": as_of,
+            **sections,
+            "assets_piastres": totals["assets"],
+            "liabilities_piastres": totals["liabilities"],
+            "posted_equity_piastres": totals["equity"],
+            "unclosed_result_piastres": unclosed_result,
+            "equity_piastres": total_equity,
+            "liabilities_and_equity_piastres": claims,
+            "difference_piastres": difference,
+            "balanced": difference == 0,
+        }
+
+    def reconcile_parties(self, *, as_of: str | None = None) -> dict[str, dict]:
+        """Compare 1100/2010 with their tagged subledgers in natural balance signs."""
+        _validate_cutoff(as_of)
+        with closing(self.db.connect()) as conn:
+            rows = conn.execute(
+                "WITH balances AS ("
+                " SELECT l.account_id, l.party_type, l.party_id, COUNT(*) AS line_count,"
+                " SUM(l.debit_piastres-l.credit_piastres) AS balance"
+                " FROM journal_lines l JOIN journal_entries e ON e.id=l.journal_entry_id"
+                " JOIN accounts a ON a.id=l.account_id"
+                " WHERE a.code IN ('1100','2010') AND (:as_of IS NULL OR substr(e.entry_date,1,10)<=:as_of)"
+                " GROUP BY l.account_id, l.party_type, l.party_id"
+                ") SELECT a.code, b.party_type, b.party_id, b.line_count, b.balance"
+                " FROM accounts a LEFT JOIN balances b ON b.account_id=a.id"
+                " WHERE a.code IN ('1100','2010') ORDER BY a.code, b.party_type, b.party_id",
+                {"as_of": as_of},
+            ).fetchall()
+
+        reports = {}
+        for code, party_type, sign in (("1100", "CUSTOMER", 1), ("2010", "SUPPLIER", -1)):
+            balances = [row for row in rows if row["code"] == code]
+            if not balances:
+                raise ValueError(f"missing control account: {code}")
+            ledger = sum((row["balance"] or 0) * sign for row in balances)
+            parties = {}
+            unassigned = 0
+            for row in balances:
+                if row["party_type"] == party_type and row["party_id"] is not None:
+                    parties[row["party_id"]] = row["balance"] * sign
+                else:
+                    unassigned += row["line_count"] or 0
+            subledger = sum(parties.values())
+            reports[code] = {
+                "ledger_piastres": ledger,
+                "party_balances_piastres": parties,
+                "subledger_piastres": subledger,
+                "difference_piastres": ledger - subledger,
+                "unassigned_lines": unassigned,
+                "matched": unassigned == 0 and ledger == subledger,
+            }
+        return reports
+
+    def reconcile_inventory(self) -> dict[str, int | bool]:
+        """Compare the current 1200 balance with current sellable cost layers."""
+        with closing(self.db.connect()) as conn:
+            row = conn.execute(
+                "SELECT a.code, COALESCE(SUM(l.debit_piastres-l.credit_piastres),0) AS ledger,"
+                " (SELECT COALESCE(SUM(i.remaining_cost_piastres),0)"
+                "  FROM inventory_cost_layers i LEFT JOIN reels r ON r.id=i.reel_id"
+                "  WHERE i.status='OPEN' AND i.remaining_qty_micros>0"
+                "  AND (i.reel_id IS NULL OR r.status IN ('SEALED','OPENED'))) AS layers"
+                " FROM accounts a LEFT JOIN journal_lines l ON l.account_id=a.id"
+                " WHERE a.code='1200' GROUP BY a.id"
+            ).fetchone()
+        if row is None:
+            raise ValueError("missing control account: 1200")
+        difference = row["ledger"] - row["layers"]
+        return {
+            "ledger_piastres": row["ledger"],
+            "layers_piastres": row["layers"],
+            "difference_piastres": difference,
+            "matched": difference == 0,
+        }
 
     def create_financial_account(self, code: str, name_ar: str, account_type: str, gl_code: str) -> int:
         with self.db.transaction() as conn:

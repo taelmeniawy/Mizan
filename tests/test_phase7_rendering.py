@@ -7,6 +7,7 @@ test and does not cover T-DOC-009.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -258,33 +259,40 @@ def test_issue_failure_cleans_file_and_does_not_leave_export(render_shop, monkey
 
 def test_printer_path_uses_the_same_page_layout(render_shop, tmp_path):
     shop, export = render_shop
-    quote = shop.create_quote(lines=_lines(shop, 30))
+    quote = shop.create_quote(lines=_lines(shop, 45))
     result = export.issue_official(quote, actor_id=shop.shop.manager)
     printer_path = tmp_path / "shared-layout.pdf"
     printer = _pdf_printer(printer_path)
 
     printed = export.print_official(quote, printer)
     report = read_pdf(printer_path)
-    assert printed["pages"] == report.page_count == result["pages"]
+    assert printed["pages"] == report.page_count == result["pages"] >= 2
     _assert_a4(report)
     assert ARABIC_DESCRIPTION in report.normalized_text
     assert "الإجمالي المستحق" in report.normalized_text
     assert any("NotoNaskhArabic" in name for name in report.font_names)
 
 
-def test_real_a4_printer_is_not_available_here():
+def test_real_a4_printer_submission(request):
+    printer_name = os.environ.get("MIZAN_A4_TEST_PRINTER")
+    if not printer_name:
+        pytest.skip("set MIZAN_A4_TEST_PRINTER to run the manual T-DOC-009 check")
+
     ensure_qt_app()
-    physical = [
-        printer for printer in QPrinterInfo.availablePrinters()
-        if not any(marker in printer.printerName().lower() for marker in (
-            "print to pdf", "xps", "fax", "onenote",
-        ))
-    ]
-    if not physical:
-        pytest.skip(
-            "no physical A4 printer is available; T-DOC-009 remains open "
-            "and Microsoft Print to PDF is not a substitute"
-        )
-    # A physical printer exists, but this suite does not send an unattended
-    # print job. The manual T-DOC-009 acceptance check remains required.
-    pytest.skip("physical printer detected; run the manual T-DOC-009 check")
+    info = QPrinterInfo.printerInfo(printer_name)
+    assert not info.isNull(), f"printer queue not found: {printer_name}"
+    virtual_markers = ("pdf", "xps", "fax", "onenote")
+    assert not any(marker in info.printerName().casefold() for marker in virtual_markers), (
+        "T-DOC-009 requires a physical printer queue"
+    )
+
+    shop, export = request.getfixturevalue("render_shop")
+    quote = shop.create_quote(lines=_lines(shop, 45))
+    issued = export.issue_official(quote, actor_id=shop.shop.manager)
+    printer = QPrinter(info, QPrinter.PrinterMode.HighResolution)
+    assert printer.outputFormat() == QPrinter.OutputFormat.NativeFormat
+    printer.setDocName(f"Mizan T-DOC-009 {issued['document_no']}")
+
+    printed = export.print_official(quote, printer)
+    assert printed["pages"] == issued["pages"] >= 2
+    print(f"Inspect all {printed['pages']} printed A4 pages before recording T-DOC-009 as passed.")

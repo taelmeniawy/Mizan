@@ -427,6 +427,37 @@ def test_conversion_rejects_non_issued_and_is_full_only(qs: QuoteShop):
     assert quote_count == sale_count == 2
 
 
+def test_partial_acceptance_requires_a_revised_quotation(qs: QuoteShop):
+    actor = qs.shop.manager
+    accepted_line = qs.line(quantity_micros=2_000_000)
+    declined_line = qs.line(quantity_micros=3_000_000)
+    original = qs.create_quote(lines=[accepted_line, declined_line])
+    qs.issue(original)
+    original_snapshot = qs.documents.snapshot("QUOTATION", original)
+
+    with pytest.raises(QuotationError, match="only a draft quotation can be edited"):
+        qs.quotes.update_draft(original, [accepted_line], actor_id=actor)
+
+    revision = qs.quotes.create_revision(original, actor_id=actor)
+    qs.quotes.update_draft(revision, [accepted_line], actor_id=actor)
+    qs.issue(revision)
+    qs.quotes.accept_quotation(revision, actor_id=actor)
+
+    with pytest.raises(QuotationError, match="SUPERSEDED cannot be converted"):
+        qs.convert(original)
+    sale_id = qs.convert(revision)["sales_id"]
+
+    revised_line, = qs.quotes.get_quotation(revision)["lines"]
+    with qs.db.connect() as conn:
+        sale_line, = conn.execute(
+            "SELECT quotation_line_id FROM sales_lines WHERE sales_id=?", (sale_id,)
+        ).fetchall()
+    assert sale_line["quotation_line_id"] == revised_line["id"]
+    assert revised_line["quantity_micros"] == accepted_line["quantity_micros"]
+    assert _row(qs, "sales", sale_id)["source_quotation_id"] == revision
+    assert qs.documents.snapshot("QUOTATION", original) == original_snapshot
+
+
 def test_cancel_conversion_draft_restores_accepted_status(qs: QuoteShop):
     quote = qs.create_quote()
     qs.issue(quote)

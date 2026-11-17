@@ -6,6 +6,7 @@ from mizan.accounting import AccountingService
 from mizan.lcp import outflow_cost, return_cost, t_layer, validate_layer
 from mizan.master import MasterDataService
 from mizan.purchasing import InventoryError, PurchasingService
+from mizan.reporting import ReportingService
 
 
 @pytest.fixture()
@@ -52,6 +53,29 @@ def test_T_INV_001_fifo_two_lots(shop):
     shop["purchasing"].post_invoice(second)
     result = shop["purchasing"].issue_fifo(shop["lot_product"], 120_000_000)
     assert result["cost"] == 244000
+
+
+def test_inventory_reconciliation_counts_each_sellable_layer_once(shop):
+    lot = _invoice(shop, shop["lot_product"], 10_000_000, 20_000_000)
+    reels = _invoice(shop, shop["reel_product"], 10_000_000, 30_000_000,
+                     reel_lengths=[6_000_000, 4_000_000])
+    _invoice(shop, shop["lot_product"], 10_000_000, 20_000_000)
+    shop["purchasing"].post_invoice(lot)
+    shop["purchasing"].post_invoice(reels)
+    reel_id = shop["db"].scalar("SELECT MIN(id) FROM reels")
+    shop["purchasing"].damage_reel(reel_id, 6_000_000)
+
+    accounting = shop["accounting"]
+    assert accounting.reconcile_inventory() == {
+        "ledger_piastres": 32_000,
+        "layers_piastres": 32_000,
+        "difference_piastres": 0,
+        "matched": True,
+    }
+    accounting.post_opening("2026-01-01", "1200", 100)
+    report = accounting.reconcile_inventory()
+    assert report["difference_piastres"] == 100
+    assert not report["matched"]
 
 
 def test_T_INV_003_lcp_full_layer(shop):
@@ -126,6 +150,51 @@ def test_T_SUP_001_purchase_return(shop):
     assert result["total"] == 20000
     assert shop["purchasing"].lot_remaining(lot) == (90_000_000, 180000)
     assert shop["accounting"].account_balance("2010") == -180000
+
+
+def test_supplier_aging_and_statement_use_posting_dates_and_show_unallocated_balance(shop):
+    purchasing = shop["purchasing"]
+    supplier = shop["supplier"]
+    invoice = purchasing.create_invoice(
+        supplier, "2026-11-10", [{"product_id": shop["lot_product"], "unit_id": shop["meter"],
+                                  "quantity_micros": 10_000_000, "unit_price_micros": 20_000_000}],
+        expense_piastres=500, due_date="2026-11-20",
+    )
+    purchasing.post_invoice(invoice)
+    _invoice(shop, shop["lot_product"], 10_000_000, 20_000_000)  # draft
+    db = shop["db"]
+    line = db.scalar("SELECT id FROM purchase_invoice_lines WHERE purchase_invoice_id=?", (invoice,))
+    lot = db.scalar("SELECT id FROM purchase_lots WHERE purchase_invoice_line_id=?", (line,))
+    returned = purchasing.create_purchase_return(invoice, [
+        {"purchase_invoice_line_id": line, "lot_id": lot, "quantity_micros": 2_000_000},
+    ], "2026-11-12")
+    purchasing.post_purchase_return(returned)
+    shop["accounting"].post_journal("2026-11-13", "SUPPLIER_PAYMENT", 1, [
+        {"account_code": "2010", "debit": 3_000, "party_type": "SUPPLIER", "party_id": supplier},
+        {"account_code": "1010", "credit": 3_000},
+    ])
+
+    reports = ReportingService(db)
+    before_return = reports.supplier_payables_aging("2026-11-11", supplier_id=supplier)
+    assert before_return["buckets_piastres"]["not_due"] == before_return["ledger_piastres"] == 20_000
+    report = reports.supplier_payables_aging("2026-11-20")
+    row, = report["invoices"]
+    assert row["purchase_invoice_id"] == invoice
+    assert row["days_past_due"] == 0
+    assert report["buckets_piastres"]["0_30"] == 15_900
+    assert report["ledger_piastres"] == 12_900
+    assert report["difference_piastres"] == -3_000
+
+    statement = reports.supplier_statement(supplier, as_of="2026-11-20")
+    assert [entry["source_type"] for entry in statement] == [
+        "PURCHASE_INVOICE", "PURCHASE_RETURN", "SUPPLIER_PAYMENT",
+    ]
+    assert [entry["balance_piastres"] for entry in statement] == [20_000, 15_900, 12_900]
+    assert statement[0]["document_no"] == row["document_no"]
+    assert statement[1]["document_no"] == db.scalar(
+        "SELECT document_no FROM purchase_returns WHERE id=?", (returned,),
+    )
+    assert statement[2]["document_no"] == statement[2]["entry_no"]
 
 
 def test_T_DMG_001_damage(shop):

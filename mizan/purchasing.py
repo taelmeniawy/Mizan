@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from .accounting import AccountingService
 from .auth import PermissionService
@@ -60,21 +60,25 @@ class PurchasingService:
 
     def create_invoice(self, supplier_id: int, invoice_date: str, lines: list[dict], expense_piastres: int = 0,
                        payment_type: str = "CREDIT", supplier_invoice_no: str | None = None,
-                       financial_account_id: int | None = None, created_by: int | None = None) -> int:
+                       financial_account_id: int | None = None, created_by: int | None = None,
+                       *, due_date: str | None = None) -> int:
         if not lines:
             raise ValueError("invoice needs lines")
         if expense_piastres < 0:
             raise ValueError("expense cannot be negative")
         if payment_type not in {"CASH", "CREDIT"}:
             raise ValueError("invalid payment type")
+        if due_date is not None and date.fromisoformat(due_date).isoformat() != due_date:
+            raise ValueError("due_date must be a YYYY-MM-DD date")
         with self.db.transaction() as conn:
             if conn.execute("SELECT 1 FROM suppliers WHERE id=?", (supplier_id,)).fetchone() is None:
                 raise ValueError("supplier not found")
             document_no = next_number(conn, "PURCHASE_INVOICE", int(invoice_date[:4]), "PI-")
             cur = conn.execute(
-                "INSERT INTO purchase_invoices(document_no,supplier_id,supplier_invoice_no,invoice_date,payment_type,financial_account_id,expense_piastres,created_by) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (document_no, supplier_id, supplier_invoice_no, invoice_date, payment_type, financial_account_id, expense_piastres, created_by),
+                "INSERT INTO purchase_invoices(document_no,supplier_id,supplier_invoice_no,invoice_date,"
+                "due_date,payment_type,financial_account_id,expense_piastres,created_by) VALUES(?,?,?,?,?,?,?,?,?)",
+                (document_no, supplier_id, supplier_invoice_no, invoice_date, due_date,
+                 payment_type, financial_account_id, expense_piastres, created_by),
             )
             invoice_id = int(cur.lastrowid)
             subtotal = 0
@@ -211,6 +215,91 @@ class PurchasingService:
                 (_now(), journal_id, invoice_id),
             )
             return {"invoice_id": invoice_id, "journal_id": journal_id, "total": total}
+
+    def post_supplier_payment(self, supplier_id: int, financial_account_id: int, payment_date: str,
+                              allocations: list[dict], *, reference: str, actor_id: int) -> dict:
+        """Post one fully allocated supplier payment and its journal atomically."""
+        PermissionService(self.db).require(actor_id, "manage_supplier_payments")
+        if date.fromisoformat(payment_date).isoformat() != payment_date:
+            raise ValueError("payment_date must be a YYYY-MM-DD date")
+        reference = reference.strip()
+        if not reference or not allocations:
+            raise ValueError("payment requires a reference and invoice allocations")
+        amounts = {}
+        for allocation in allocations:
+            invoice_id = allocation["purchase_invoice_id"]
+            amount = allocation["amount_piastres"]
+            if type(amount) is not int or amount <= 0 or invoice_id in amounts:
+                raise ValueError("each invoice needs one positive integer allocation")
+            amounts[invoice_id] = amount
+        total = sum(amounts.values())
+
+        with self.db.transaction() as conn:
+            if conn.execute(
+                "SELECT 1 FROM supplier_payments WHERE supplier_id=? AND reference=?",
+                (supplier_id, reference),
+            ).fetchone():
+                raise ValueError("supplier payment reference already exists")
+            account = conn.execute(
+                "SELECT a.code FROM financial_accounts f JOIN accounts a ON a.id=f.gl_account_id"
+                " WHERE f.id=? AND f.is_active=1 AND a.account_type='ASSET' AND a.is_control=0",
+                (financial_account_id,),
+            ).fetchone()
+            if account is None:
+                raise ValueError("active financial account not found")
+
+            for invoice_id, amount in amounts.items():
+                outstanding = conn.execute(
+                    "SELECT i.subtotal_piastres - COALESCE(("
+                    " SELECT SUM(r.total_piastres) FROM purchase_returns r"
+                    " JOIN journal_entries j ON j.id=r.journal_entry_id"
+                    " WHERE r.purchase_invoice_id=i.id AND r.status='POSTED' AND j.reversed_by_id IS NULL),0)"
+                    " - COALESCE(("
+                    " SELECT SUM(a.amount_piastres) FROM supplier_payment_allocations a"
+                    " JOIN supplier_payments p ON p.id=a.payment_id"
+                    " JOIN journal_entries j ON j.id=p.journal_entry_id"
+                    " WHERE a.purchase_invoice_id=i.id AND j.reversed_by_id IS NULL),0)"
+                    " FROM purchase_invoices i JOIN journal_entries e ON e.id=i.journal_entry_id"
+                    " WHERE i.id=? AND i.supplier_id=? AND i.status='POSTED' AND i.payment_type='CREDIT'"
+                    " AND e.entry_date<=? AND e.reversed_by_id IS NULL",
+                    (invoice_id, supplier_id, payment_date),
+                ).fetchone()
+                if outstanding is None:
+                    raise ValueError("allocation requires a posted credit invoice for this supplier by the payment date")
+                if amount > outstanding[0]:
+                    raise ValueError("allocation exceeds invoice outstanding balance")
+
+            ledger = conn.execute(
+                "SELECT COALESCE(SUM(l.credit_piastres-l.debit_piastres),0),"
+                " COALESCE(SUM(CASE WHEN e.entry_date<=? THEN l.credit_piastres-l.debit_piastres ELSE 0 END),0)"
+                " FROM journal_lines l JOIN accounts a ON a.id=l.account_id"
+                " JOIN journal_entries e ON e.id=l.journal_entry_id"
+                " WHERE a.code='2010' AND l.party_type='SUPPLIER' AND l.party_id=?",
+                (payment_date, supplier_id),
+            ).fetchone()
+            if total > min(ledger):
+                raise ValueError("payment exceeds supplier outstanding balance")
+
+            document_no = next_number(conn, "SUPPLIER_PAYMENT", int(payment_date[:4]), "SP-")
+            payment_id = conn.execute(
+                "INSERT INTO supplier_payments(document_no,supplier_id,financial_account_id,payment_date,"
+                "reference,amount_piastres,created_by) VALUES(?,?,?,?,?,?,?)",
+                (document_no, supplier_id, financial_account_id, payment_date, reference, total, actor_id),
+            ).lastrowid
+            conn.executemany(
+                "INSERT INTO supplier_payment_allocations(payment_id,purchase_invoice_id,amount_piastres)"
+                " VALUES(?,?,?)",
+                [(payment_id, invoice_id, amount) for invoice_id, amount in amounts.items()],
+            )
+            journal_id = self.accounting.post_journal(
+                payment_date, "SUPPLIER_PAYMENT", payment_id,
+                [{"account_code": "2010", "debit": total, "party_type": "SUPPLIER", "party_id": supplier_id},
+                 {"account_code": account["code"], "credit": total}],
+                description=f"دفعة مورد {document_no}", posted_by=actor_id, conn=conn,
+            )
+            conn.execute("UPDATE supplier_payments SET journal_entry_id=? WHERE id=?", (journal_id, payment_id))
+        return {"payment_id": payment_id, "document_no": document_no,
+                "journal_id": journal_id, "amount_piastres": total}
 
     def _refresh_lot_status(self, conn, lot_id: int) -> None:
         refresh_lot_status(conn, lot_id)

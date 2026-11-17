@@ -6,6 +6,7 @@ import pytest
 
 from mizan.accounting import AccountingService
 from mizan.auth import PermissionDenied
+from mizan.reporting import ReportingService
 from mizan.sales import InsufficientStock
 from phase6_support import Shop, build_shop
 
@@ -694,6 +695,22 @@ def test_customer_statement_shows_credits_without_negative_ar(shop: Shop):
     }
     assert all(row["ar_balance"] >= 0 for row in statement)
     assert all(row["credit_balance"] >= 0 for row in statement)
+
+    reports = ReportingService(shop.db)
+    period = reports.customer_period_statement(shop.retail, "2026-11-12", "2026-11-13")
+    assert period["accounts"]["1100"] == {
+        "opening_piastres": 0, "closing_piastres": 20_000, "debit_piastres": 30_000, "credit_piastres": 10_000,
+    }
+    assert period["accounts"]["2020"] == {
+        "opening_piastres": 10_000, "closing_piastres": 0, "debit_piastres": 10_000, "credit_piastres": 0,
+    }
+    assert [row["balance_piastres"] for row in period["movements"]] == [30_000, 0, 20_000]
+    assert period["movements"][0]["document_no"] == shop.db.scalar(
+        "SELECT document_no FROM sales WHERE id=?", (second,),
+    )
+    empty = reports.customer_period_statement(shop.retail, "2026-11-14", "2026-11-14")
+    assert empty["movements"] == []
+    assert empty["accounts"]["1100"]["opening_piastres"] == empty["accounts"]["1100"]["closing_piastres"] == 20_000
 
 
 def test_T_BAL_006_ar_never_negative_after_receipts_and_returns(shop: Shop):

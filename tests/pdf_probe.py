@@ -136,24 +136,46 @@ def _decode_hex_string(value: str, mapping: dict) -> str:
     return "".join(mapping.get(int(chunk, 16), "") for chunk in chunks if chunk)
 
 
-def _page_text(objects: dict[int, bytes], page_body: bytes) -> str:
+def _page_content(objects: dict[int, bytes], page_body: bytes) -> bytes:
     contents_match = re.search(rb"/Contents\s+(\d+)\s+0\s+R", page_body)
     if not contents_match:
         array_match = re.search(rb"/Contents\s*\[(.*?)\]", page_body, re.S)
         if not array_match:
-            return ""
-        content = b"".join(
+            return b""
+        return b"".join(
             _stream(objects.get(int(ref), b""))
             for ref in re.findall(rb"(\d+)\s+0\s+R", array_match.group(1))
         )
-    else:
-        content = _stream(objects.get(int(contents_match.group(1)), b""))
+    return _stream(objects.get(int(contents_match.group(1)), b""))
+
+
+def _page_font_bases(objects: dict[int, bytes], page_body: bytes) -> dict[str, str]:
+    resources = page_body
+    resource_match = re.search(rb"/Resources\s+(\d+)\s+0\s+R", page_body)
+    if resource_match:
+        resources = objects.get(int(resource_match.group(1)), b"")
+    font_section = re.search(rb"/Font\s*<<(.*?)>>", resources, re.S)
+    if not font_section:
+        return {}
+    result: dict[str, str] = {}
+    for name, font_id in re.findall(rb"/(F\d+)\s+(\d+)\s+0\s+R", font_section.group(1)):
+        body = objects.get(int(font_id), b"")
+        base = re.search(rb"/BaseFont\s*/([^\s/>]+)", body)
+        if base:
+            result[name.decode("ascii")] = base.group(1).decode("latin-1")
+    return result
+
+
+def _page_font_runs(objects: dict[int, bytes], page_body: bytes):
+    """Yield ``(base_font_name, text)`` for every text run on one page."""
+    content = _page_content(objects, page_body)
     if not content:
-        return ""
+        return
     text = content.decode("latin-1", errors="replace")
     fonts = _font_maps(objects, page_body)
+    bases = _page_font_bases(objects, page_body)
     current: dict = {}
-    pieces: list[str] = []
+    current_name: str | None = None
 
     token_re = re.compile(
         r"/(F\d+)\s+[\d.]+\s+Tf"
@@ -164,15 +186,36 @@ def _page_text(objects: dict[int, bytes], page_body: bytes) -> str:
     )
     for token in token_re.finditer(text):
         if token.group(1):
-            current = fonts.get(token.group(1), {})
+            current_name = token.group(1)
+            current = fonts.get(current_name, {})
         elif token.group(2):
-            pieces.append(_decode_hex_string(token.group(2), current))
+            yield bases.get(current_name, ""), _decode_hex_string(token.group(2), current)
         elif token.group(3) is not None:
             for value in re.findall(r"<([0-9A-Fa-f]+)>", token.group(3)):
-                pieces.append(_decode_hex_string(value, current))
+                yield bases.get(current_name, ""), _decode_hex_string(value, current)
         elif token.group(4) is not None:
-            pieces.append(token.group(4))
-    return "".join(pieces)
+            yield bases.get(current_name, ""), token.group(4)
+
+
+def _page_text(objects: dict[int, bytes], page_body: bytes) -> str:
+    return "".join(text for _font, text in _page_font_runs(objects, page_body))
+
+
+def font_text_map(path: str | Path) -> dict[str, str]:
+    """Map each embedded base font name to the text it renders.
+
+    Used to verify which characters come from an approved bundled font versus a
+    system fallback; the probe deliberately does not interpret glyph shapes.
+    """
+    data = Path(path).read_bytes()
+    objects = _objects(data)
+    result: dict[str, list[str]] = {}
+    for page in objects.values():
+        if not re.search(rb"/Type\s*/Page(?!s)", page):
+            continue
+        for font, text in _page_font_runs(objects, page):
+            result.setdefault(font, []).append(text)
+    return {font: "".join(pieces) for font, pieces in result.items()}
 
 
 def read_pdf(path: str | Path) -> PdfReport:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shutil
 import uuid
 from pathlib import Path
 
@@ -83,6 +84,61 @@ class DocumentStore:
             pass
         except OSError as exc:
             raise DocumentError(f"cannot remove document file: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # Content-addressed assets (logos)
+    # ------------------------------------------------------------------
+
+    def capture_logo(self, source_path: str | None) -> dict | None:
+        """Copy a configured logo into content-addressed managed storage.
+
+        Returns ``None`` when no usable logo file is configured.  The stored
+        asset path is derived from the SHA-256 of the file, so a later change to
+        the source path or its content cannot alter an issued snapshot's logo.
+        """
+        if not source_path:
+            return None
+        source = Path(source_path).expanduser()
+        if not source.is_file():
+            return None
+        digest = sha256_file(source)
+        suffix = source.suffix.lower()
+        if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
+            suffix = ""
+        relative_path = f"assets/logos/{digest}{suffix}"
+        final_path = self.resolve(relative_path)
+        if final_path.exists():
+            if sha256_file(final_path) != digest:
+                raise DocumentError(
+                    "managed logo asset hash does not match its content-addressed path"
+                )
+            return {
+                "sha256": digest,
+                "relative_path": relative_path,
+                "file_size": final_path.stat().st_size,
+            }
+
+        temp_path = self.new_temp_path(suffix)
+        try:
+            shutil.copyfile(source, temp_path)
+            if sha256_file(temp_path) != digest:
+                raise DocumentError("logo file changed while it was being captured")
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            if final_path.exists():
+                if sha256_file(final_path) != digest:
+                    raise DocumentError(
+                        "managed logo asset hash does not match its content-addressed path"
+                    )
+            else:
+                os.replace(temp_path, final_path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+        return {
+            "sha256": digest,
+            "relative_path": relative_path,
+            "file_size": final_path.stat().st_size,
+        }
 
     # ------------------------------------------------------------------
     # Verification

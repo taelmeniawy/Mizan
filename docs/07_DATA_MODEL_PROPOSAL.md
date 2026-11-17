@@ -91,7 +91,8 @@ erDiagram
 |---|---|---|
 | `store_profile` | `id`, `name_ar`, `legal_name`, `address`, `phone`, `logo_asset_id` | صف واحد فعّال |
 | `logo_assets` | `id`, `content_hash`, `relative_path`, `mime`, `width`, `height`, `created_at` | `content_hash` UNIQUE |
-| `warehouses` | `id`, `code`, `name_ar`, `is_default` | `code` UNIQUE |
+
+> **حالة 2026-11-17:** التنفيذ الحالي يستخدم `store_profile.logo_path` وينسخ الشعار إلى `assets/logos/<sha256>.<suffix>` في مجلد المستندات المُدار، ويسجّل `logo_asset` في لقطة العرض. جدول `logo_assets` لم يُنفَّذ بعد؛ التفاصيل أعلاه تبقى مقترحًا.| `warehouses` | `id`, `code`, `name_ar`, `is_default` | `code` UNIQUE |
 | `units` | `id`, `code`, `name_ar`, `allows_fraction`, `is_active` | `code` UNIQUE |
 | `products` | `id`, `sku`, `name_ar`, `description`, `base_unit_id`, `tracking_mode`, `default_sale_price_micros`, `low_stock_threshold_micros`, `is_active` | `sku` UNIQUE؛ `tracking_mode IN ('LOT','REEL')` |
 | `product_barcodes` | `id`, `product_id`, `barcode` | `barcode` UNIQUE |

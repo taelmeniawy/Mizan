@@ -63,6 +63,11 @@ class QuotationExportService:
         except ValueError as exc:
             raise QuotationExportError(str(exc)) from exc
 
+        logo_asset = None
+        if content.get("store"):
+            logo_asset = self.store.capture_logo(content["store"].get("logo_path"))
+            content["store"]["logo_asset"] = logo_asset
+
         temp_path = self.store.new_temp_path()
         installed_relative: str | None = None
         try:
@@ -85,6 +90,7 @@ class QuotationExportService:
                     "generated_by": actor_id,
                 },
                 expected_snapshot=content,
+                logo_asset=logo_asset,
                 actor_id=actor_id,
             )
             return {

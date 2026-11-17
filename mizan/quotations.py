@@ -497,6 +497,7 @@ class QuotationService:
     def issue_quotation(self, quotation_id: int, *, official_export_id: int | None = None,
                         official_export: dict | None = None,
                         expected_snapshot: dict | None = None,
+                        logo_asset: dict | None = None,
                         actor_id: int | None = None) -> int:
         if official_export_id is not None and official_export is not None:
             raise QuotationError("provide official_export_id or official_export, not both")
@@ -559,7 +560,7 @@ class QuotationService:
                 )
                 _audit(conn, "QUOTATION_SUPERSEDED", previous["id"], actor_id)
 
-            snapshot = self._build_snapshot(conn, row, export)
+            snapshot = self._build_snapshot(conn, row, export, logo_asset=logo_asset)
             if expected_snapshot is not None:
                 rendered_content = {
                     key: value for key, value in snapshot.items()
@@ -861,7 +862,8 @@ class QuotationService:
 
     def _build_snapshot(self, conn, row, export=None, *,
                         template_version: str | None = None,
-                        renderer_version: str | None = None) -> dict:
+                        renderer_version: str | None = None,
+                        logo_asset: dict | None = None) -> dict:
         store = conn.execute("SELECT * FROM store_profile WHERE id=1").fetchone()
         customer = conn.execute(
             "SELECT * FROM customers WHERE id=?", (row["customer_id"],)
@@ -919,6 +921,7 @@ class QuotationService:
                 "address": store["address"],
                 "phone": store["phone"],
                 "logo_path": store["logo_path"],
+                "logo_asset": logo_asset,
             },
             "customer": {
                 "id": customer["id"],
@@ -956,7 +959,8 @@ class QuotationService:
 
     def build_snapshot_content(self, quotation_id: int, *,
                                template_version: str,
-                               renderer_version: str) -> dict:
+                               renderer_version: str,
+                               logo_asset: dict | None = None) -> dict:
         """Build the renderable snapshot content without an export row.
 
         The renderer uses this content; `issue_quotation` later persists the
@@ -966,7 +970,7 @@ class QuotationService:
             row = _quotation_row(conn, quotation_id)
             return self._build_snapshot(
                 conn, row, template_version=template_version,
-                renderer_version=renderer_version,
+                renderer_version=renderer_version, logo_asset=logo_asset,
             )
 
     def get_quotation(self, quotation_id: int) -> dict:

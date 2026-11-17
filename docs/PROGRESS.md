@@ -1,6 +1,6 @@
 # Progress
 
-- Phase: **7 in progress — partial.** Phases 1–6 are complete. Phase 7's quotation core and the approved ADR-0004 Option B A4 renderer are implemented and tested, but Phase 7 is **not complete**: T-DOC-005 (approved/licensed Arabic font), T-DOC-009 (real A4 printer), and T-DOC-007 (golden image) remain open. Phase 8 has not started and remains gated on the full Phase 7 gate.
+- Phase: **7 in progress — partial.** Phases 1–6 are complete. Phase 7's quotation core and the approved ADR-0004 Option B A4 renderer are implemented and tested; logo snapshot/hash/reprint stability is covered with synthetic assets. Phase 7 is **not complete**: T-DOC-005 (approved/licensed Arabic font), T-DOC-009 (real A4 printer), T-DOC-007 (golden image), and logo rendering/approved identity (`OQ-DOC-002`) remain open. Phase 8 has not started and remains gated on the full Phase 7 gate.
 - Done:
   - Phase 6 sales invoices: retail/wholesale/contractor, cash/credit, DRAFT edit/cancel, POSTED immutability, reversal record.
   - Price resolver priority customer price → price list → default; manual price source/reason; line and invoice discounts with largest-remainder allocation.
@@ -77,11 +77,19 @@ Concrete defects found and fixed in this check:
 - **Serial-column wrap:** the line-number column was too narrow (5%), so 3-digit serials began wrapping, row heights increased, and rows/page dropped to 18–21; a 250-line document produced 12 pages. Widening the serial column to 7% restored 30 rows/page and reduced the 250-line document to 9 pages.
 - **Pagination cost:** the previous paginator rebuilt the entire remaining document plus summary and used a broad binary search on every page, taking roughly 9–10s for 100 lines and ~39s for 250. The paginator now uses a measured row-height estimate, a narrow fallback search only when the estimate does not fit, and reuses the built page documents for PDF/print output. It preserves the same page-plan invariants but is substantially faster; there is no timing threshold in the tests.
 
+### Logo snapshot stability — T-QUO-019 / AC-QUO-003 (2026-11-17)
+
+- At official issue via `QuotationExportService`, if `store_profile.logo_path` points to an existing file, the logo is copied into managed content-addressed storage (`assets/logos/<sha256>.<suffix>`). The immutable snapshot records both the original configured `logo_path` and a `logo_asset` object with `sha256`, `relative_path`, and `file_size`. A missing/unusable configured path is treated as no asset; it does not block issue.
+- A later change to the logo file at the same path, or changing `store_profile.logo_path`, affects only documents issued afterward. The old snapshot, official PDF bytes/SHA-256, and reprint result remain unchanged; the old content-addressed asset remains available. A new issue captures the new content hash/path.
+- Verified with temporary synthetic PNG images only. The renderer still does **not** draw a logo, and no real store logo, brand asset, font, or UI choice was added. Logo rendering/branding and approved logo identity remain open under `OQ-DOC-002`.
+- Status: the snapshot/hash/reprint-stability portion of `T-QUO-019`/`AC-QUO-003` is covered; logo-dependent visual/identity acceptance remains open.
+
 ### Tests (actual result)
 
 - Phase 7 quotation tests: `24 passed` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_quotations.py -q`.
 - Phase 7 rendering tests: `10 passed, 1 skipped` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_rendering.py -q`. The skip is the real A4-printer check because no physical printer is available.
-- Full suite: **`135 passed, 1 skipped`** — `.venv\Scripts\python.exe -m pytest -q` (run 2026-11-17, project-local `.venv`, Python 3.12.10, pytest 9.2.0, PySide6-Essentials 6.12.0).
+- Logo snapshot tests: `2 passed` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_logo_snapshot.py -q`.
+- Full suite: **`137 passed, 1 skipped`** — `.venv\Scripts\python.exe -m pytest -q` (run 2026-11-17, project-local `.venv`, Python 3.12.10, pytest 9.2.0, PySide6-Essentials 6.12.0).
 - The older quotation issue tests still use a test-double export row; the rendering tests exercise the real renderer/export/PDF path.
 
 ### Implementation notes / deviations
@@ -92,14 +100,14 @@ Concrete defects found and fixed in this check:
 - The renderer uses the installed system font `Microsoft Sans Serif` as a platform compatibility fallback (candidate list: Microsoft Sans Serif/Tahoma/Arial). No font file is bundled and no brand/identity font is approved. T-DOC-005 remains open.
 - Store identity may be absent until the store profile is configured; logo/font remain deliberately unbundled (`OQ-DOC-002`).
 - Revisions copy the source `issue_date`/`valid_until`; the draft can be edited before issuing. This is an implementation choice, not a new business approval.
-- No UI, Qt WebEngine, separate PDF library, logo asset, bundled font, or physical-printer acceptance test was added.
+- No UI, Qt WebEngine, separate PDF library, real store logo asset, bundled font, or physical-printer acceptance test was added.
 
 ### What remains in Phase 7 (open)
 
 - **T-DOC-005:** approved/licensed Arabic font with embedding/re-distribution verification. The platform fallback is not an approved font.
 - **T-DOC-009:** real A4 printer test. The machine currently exposes only Microsoft Print to PDF, Microsoft XPS Document Writer, and Fax; **T-DOC-010** confirms Print to PDF is not a substitute.
 - **T-DOC-007:** golden image/reference template after font/template approval.
-- **T-QUO-019 / AC-QUO-003:** logo-change historical behavior; no logo asset exists yet (`OQ-DOC-002`).
+- **Logo rendering/branding and approved logo identity** remain open (`OQ-DOC-002`). The snapshot/hash/reprint-stability portion of `T-QUO-019`/`AC-QUO-003` is covered with synthetic logo assets; no real logo was added.
 - The full Phase 7 exit criteria in `docs/11_IMPLEMENTATION_ROADMAP.md` remain unchanged. **Phase 8 must not start until they all pass.**
 
 

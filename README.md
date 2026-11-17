@@ -7,7 +7,7 @@
 
 | البند | الحالة |
 |---|---|
-| المرحلة | المراحل 1–6 منفذة ومختبرة؛ المرحلة 7 قيد التنفيذ الجزئي (نواة العروض + محرك A4/PDF/طباعة معتمد) — T-DOC-005/T-DOC-009/T-DOC-007 مفتوحة |
+| المرحلة | المراحل 1–6 منفذة ومختبرة؛ المرحلة 7 قيد التنفيذ الجزئي (نواة العروض + محرك A4/PDF/طباعة معتمد + ثبات لقطة الشعار) — T-DOC-005/T-DOC-009/T-DOC-007 وهوية الشعار مفتوحة |
 | حالة الوثائق | **معتمدة للتنفيذ — راجع docs/DECISIONS_APPROVED.md** |
 | التنفيذ البرمجي | **المراحل 1–6 منفذة + نواة المرحلة 7 ومحرك A4** (نواة بلا واجهة UI) |
 | قاعدة البيانات | **SQLite + ترحيلات 1–7** |
@@ -64,7 +64,7 @@
 | [ADR-0001](docs/adr/ADR-0001-DESKTOP-PLATFORM.md) | مقارنة منصة سطح المكتب — NEEDS APPROVAL |
 | [ADR-0002](docs/adr/ADR-0002-DATABASE-AND-DATA-INTEGRITY.md) | SQLite، القيود، المعاملات، النسخ — NEEDS APPROVAL |
 | [ADR-0003](docs/adr/ADR-0003-MONEY-AND-QUANTITY-PRECISION.md) | دقة المال والكميات وطبقات التكلفة LCP — NEEDS APPROVAL |
-| [ADR-0004](docs/adr/ADR-0004-A4-DOCUMENT-RENDERING.md) | محرك A4/PDF — **APPROVED: الخيار B (Qt)**؛ T-DOC-005/T-DOC-007/T-DOC-009 مفتوحة |
+| [ADR-0004](docs/adr/ADR-0004-A4-DOCUMENT-RENDERING.md) | محرك A4/PDF — **APPROVED: الخيار B (Qt)**؛ T-DOC-005/T-DOC-007/T-DOC-009 وهوية الشعار مفتوحة |
 | [ADR-0005](docs/adr/ADR-0005-OFFLINE-AND-BACKUP-STRATEGY.md) | offline/backup — NEEDS APPROVAL |
 
 ## اصطلاحات الوثائق

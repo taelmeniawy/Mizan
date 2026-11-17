@@ -35,6 +35,9 @@ class PdfReport:
     page_count: int
     media_boxes: tuple[tuple[float, float], ...]
     page_texts: tuple[str, ...]
+    font_names: tuple[str, ...] = ()
+    embedded_font_count: int = 0
+    has_to_unicode: bool = False
 
     @property
     def text(self) -> str:
@@ -192,4 +195,19 @@ def read_pdf(path: str | Path) -> PdfReport:
         else:
             media_boxes.append((0.0, 0.0))
         page_texts.append(_page_text(objects, page))
-    return PdfReport(len(pages), tuple(media_boxes), tuple(page_texts))
+    font_names = tuple(sorted({
+        match.group(1).decode("latin-1")
+        for body in objects.values()
+        for match in re.finditer(rb"/BaseFont\s*/([^\s/>]+)", body)
+    }))
+    embedded_font_count = sum(
+        1 for body in objects.values()
+        if b"/FontFile2" in body or b"/FontFile3" in body
+    )
+    has_to_unicode = any(b"/ToUnicode" in body for body in objects.values())
+    return PdfReport(
+        len(pages), tuple(media_boxes), tuple(page_texts),
+        font_names=font_names,
+        embedded_font_count=embedded_font_count,
+        has_to_unicode=has_to_unicode,
+    )

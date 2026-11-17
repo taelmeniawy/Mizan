@@ -114,9 +114,7 @@ def test_pdf_text_extraction_and_arabic_shaping(render_shop):
     assert result["document_no"] in text
     assert "صفحة" in text
     assert "1 من 1" in text
-    assert default_platform_font_family() in {
-        "Microsoft Sans Serif", "Tahoma", "Arial",
-    }
+    assert default_platform_font_family() == "Noto Naskh Arabic"
 
 
 def test_multipage_repeated_headers_and_row_pagination(render_shop):
@@ -271,6 +269,7 @@ def test_printer_path_uses_the_same_page_layout(render_shop, tmp_path):
     _assert_a4(report)
     assert ARABIC_DESCRIPTION in report.normalized_text
     assert "الإجمالي المستحق" in report.normalized_text
+    assert any("NotoNaskhArabic" in name for name in report.font_names)
 
 
 def test_real_a4_printer_is_not_available_here():

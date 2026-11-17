@@ -1,6 +1,6 @@
 # Progress
 
-- Phase: **7 in progress — partial.** Phases 1–6 are complete. Phase 7's quotation core and the approved ADR-0004 Option B A4 renderer are implemented and tested; logo snapshot/hash/reprint stability is covered with synthetic assets. Phase 7 is **not complete**: T-DOC-005 (approved/licensed Arabic font), T-DOC-009 (real A4 printer), T-DOC-007 (golden image), and logo rendering/approved identity (`OQ-DOC-002`) remain open. Phase 8 has not started and remains gated on the full Phase 7 gate.
+- Phase: **7 in progress — partial.** Phases 1–6 are complete. Phase 7's quotation core, the approved ADR-0004 Option B A4 renderer, the approved Noto Naskh Arabic font, and logo snapshot/hash/reprint stability are implemented and tested. Phase 7 is **not complete**: T-DOC-009 (real A4 printer), T-DOC-007 (golden image), and logo rendering/approved identity (`OQ-DOC-002`) remain open. Phase 8 has not started and remains gated on the full Phase 7 gate.
 - Done:
   - Phase 6 sales invoices: retail/wholesale/contractor, cash/credit, DRAFT edit/cancel, POSTED immutability, reversal record.
   - Price resolver priority customer price → price list → default; manual price source/reason; line and invoice discounts with largest-remainder allocation.
@@ -23,7 +23,7 @@
 
 ## Phase 7 — partial (2026-11-17)
 
-**Status: IN PROGRESS — PARTIAL. Quotation core and the approved A4 rendering slice are implemented and tested. T-DOC-005 (approved/licensed Arabic font), T-DOC-009 (real A4 printer), and T-DOC-007 (golden image) remain open. Phase 8 is gated.**
+**Status: IN PROGRESS — PARTIAL. Quotation core, the approved A4 rendering slice, and the approved Noto Naskh Arabic font are implemented and tested. T-DOC-009 (real A4 printer), T-DOC-007 (golden image), and logo rendering/approved identity (OQ-DOC-002) remain open. Phase 8 is gated.**
 
 ### Resolved decisions applied
 
@@ -31,7 +31,7 @@
 - **`OQ-QUO-005` — cancellation policy:** `DRAFT` and `ISSUED` quotations can be cancelled with `cancel_quotation` and a recorded reason; an `ACCEPTED` quotation cannot be cancelled; `REJECTED`/`CANCELLED`/`SUPERSEDED`/`CONVERTED` are final.
 - **`OQ-DOC-001` — document numbering:** `{TYPE}-{YYYY}-{NNNNNN}` per type/year from a database sequence; committed numbers are unique and not reused; gaps are allowed only on transaction failure. Quotation roots use `Q-YYYY-NNNNNN`; revisions add `-R{version_no}`.
 - **`ADR-0004` — approved 2026-11-17:** Option B, `QTextDocument` + `QTextTable` with a custom paginator, using Qt for PDF (`QPdfWriter`) and printing (`QPrinter`). Runtime dependency is `PySide6-Essentials`; no Qt WebEngine, no separate PDF library.
-- **`OQ-DOC-002` — still deferred:** logo/font selection remains open. No logo asset or font was added or bundled. The renderer uses an installed system font as a compatibility fallback; T-DOC-005 remains open.
+- **`OQ-DOC-002` — font resolved, logo deferred:** Noto Naskh Arabic 2.000 (OFL 1.1) is approved and bundled. Logo selection/rendering remains open; no real store logo or branding asset was added.
 
 ### Implemented (quotation core)
 
@@ -56,10 +56,20 @@
 
 - PDF pages have A4 MediaBox 595×842pt (±1) and page counts match the paginator.
 - Multi-page PDFs repeat the table header; the page plans partition all line rows exactly once and keep rows whole (no row is split across pages in the tested plans).
-- Arabic text is extractable from the generated PDF after NFKC normalization, including `عرض سعر`, store/customer, line descriptions, notes/terms, and totals. The extraction test uses the platform fallback font; it does not approve that font.
+- Arabic text is extractable from the generated PDF after NFKC normalization, including `عرض سعر`, store/customer, line descriptions, notes/terms, and totals. The PDF uses the bundled Noto Naskh Arabic font; text extraction passes with `rlig` disabled because Qt 6.12 does not map some required-ligature glyphs in PDF ToUnicode.
 - The same snapshot produces the same page plans and the same extracted text on repeat renders.
 - Official export records path, SHA-256, file size, template/renderer versions and `is_official=1`; reprint returns the same file/hash; deleting the file makes reprint and print fail without regeneration.
 - A `QPrinter` PDF-output test confirms the printer path uses the same page composer/layout; it is not a physical-printer test.
+
+### Approved Arabic font — Noto Naskh Arabic (2026-11-17)
+
+- **Source/version/license:** Noto Naskh Arabic 2.000, SIL OFL 1.1, pinned upstream commit `8386d579f0fc5064dc8b66c6b5a9382f3822b82d` (`notofonts/NotoNaskhArabic`). Regular and Bold hinted TTF instances are bundled at `mizan/assets/fonts/NotoNaskhArabic/` with the upstream `LICENCE` and a `SOURCE.md` containing source URLs, version, and SHA-256 hashes.
+- **Loading:** the renderer loads the faces with `importlib.resources.files("mizan")` and `QFontDatabase.addApplicationFont`; it does not rely on the development working directory or a system Arabic font.
+- **Embedding:** generated PDFs embed Noto Naskh Arabic; `tests/test_phase7_fonts.py` verifies the pinned package hashes, OFL license text, Qt family loading, PDF font names, FontFile presence, ToUnicode, and Arabic extraction.
+- **Text extraction:** required ligatures (`rlig`) are disabled for PDF output because Qt 6.12 leaves some Noto ligature glyphs out of ToUnicode. Arabic contextual shaping (init/medi/fina) remains; this keeps PDF text searchable/copyable.
+- **Packaging:** `pyproject.toml` package data and `MANIFEST.in` include the font assets; an installed package target was verified to load the font and render an embedded-font PDF. PyInstaller/executable packaging remains Phase 10. See [packaging notes](PACKAGING_NOTES.md).
+- **Known boundary:** Noto Naskh Arabic does not contain Latin letters/punctuation, so Qt may use a system fallback for Latin codes, `EGP`, and punctuation. The Arabic font is approved, embedded, and licensed; T-DOC-005 is covered.
+- **Not changed:** no logo, UI, golden image, template approval, or physical-printer claim was added.
 
 ### Long-document / performance check (2026-11-17)
 
@@ -67,21 +77,21 @@ Measured with the project-local `.venv` on this Windows machine (Python 3.12.10,
 
 | Line items | Pages | Rows/page | Median paginate | Median render | PDF size |
 |---:|---:|---|---:|---:|---:|
-| 100 | 4 | 30/30/30/10 | 2.85s | 3.01s | 28.3 KB |
-| 250 | 9 | 30×8, 10 | 4.51s | 4.69s | 48.1 KB |
+| 100 | 6 | 20/20/20/20/19/1 | 1.80s | 1.63s | 49.1 KB |
+| 250 | 13 | 20×12, 10 | 2.46s | 2.30s | 74.9 KB |
 
-Correctness on both sizes: every line appears exactly once in the page plans, no rows are lost, each page has A4 MediaBox 595×842pt (±1), and the repeated table header/footer appear once per page. The new 120-line regression test asserts the same invariants deterministically.
+Correctness on both sizes: every line appears exactly once in the page plans, no rows are lost, each page has A4 MediaBox 595×842pt (±1), and the repeated table header/footer appear once per page. The new 120-line regression test asserts the same invariants deterministically. Measurements above use the approved Noto Naskh Arabic font; its taller line height yields 20 rows/page.
 
 Concrete defects found and fixed in this check:
 
-- **Serial-column wrap:** the line-number column was too narrow (5%), so 3-digit serials began wrapping, row heights increased, and rows/page dropped to 18–21; a 250-line document produced 12 pages. Widening the serial column to 7% restored 30 rows/page and reduced the 250-line document to 9 pages.
-- **Pagination cost:** the previous paginator rebuilt the entire remaining document plus summary and used a broad binary search on every page, taking roughly 9–10s for 100 lines and ~39s for 250. The paginator now uses a measured row-height estimate, a narrow fallback search only when the estimate does not fit, and reuses the built page documents for PDF/print output. It preserves the same page-plan invariants but is substantially faster; there is no timing threshold in the tests.
+- **Serial-column wrap:** the line-number column was too narrow (5%), so 3-digit serials began wrapping in the earlier system-font rendering, row heights increased, and rows/page dropped. Widening the serial column to 7% keeps 3-digit serials on one line; with Noto the documents paginate at 20 rows/page.
+- **Pagination cost:** the previous paginator rebuilt the entire remaining document plus summary and used a broad binary search on every page. The paginator now uses a measured row-height estimate, a narrow fallback search only when the estimate does not fit, and reuses the built page documents for PDF/print output. It preserves the same page-plan invariants; there is no timing threshold in the tests.
 
 ### Logo snapshot stability — T-QUO-019 / AC-QUO-003 (2026-11-17)
 
 - At official issue via `QuotationExportService`, if `store_profile.logo_path` points to an existing file, the logo is copied into managed content-addressed storage (`assets/logos/<sha256>.<suffix>`). The immutable snapshot records both the original configured `logo_path` and a `logo_asset` object with `sha256`, `relative_path`, and `file_size`. A missing/unusable configured path is treated as no asset; it does not block issue.
 - A later change to the logo file at the same path, or changing `store_profile.logo_path`, affects only documents issued afterward. The old snapshot, official PDF bytes/SHA-256, and reprint result remain unchanged; the old content-addressed asset remains available. A new issue captures the new content hash/path.
-- Verified with temporary synthetic PNG images only. The renderer still does **not** draw a logo, and no real store logo, brand asset, font, or UI choice was added. Logo rendering/branding and approved logo identity remain open under `OQ-DOC-002`.
+- Verified with temporary synthetic PNG images only. The renderer still does **not** draw a logo, and no real store logo, branding asset, or UI choice was added; the approved Noto Naskh Arabic font is covered separately. Logo rendering/branding and approved logo identity remain open under `OQ-DOC-002`.
 - Status: the snapshot/hash/reprint-stability portion of `T-QUO-019`/`AC-QUO-003` is covered; logo-dependent visual/identity acceptance remains open.
 
 ### Tests (actual result)
@@ -89,7 +99,8 @@ Concrete defects found and fixed in this check:
 - Phase 7 quotation tests: `24 passed` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_quotations.py -q`.
 - Phase 7 rendering tests: `10 passed, 1 skipped` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_rendering.py -q`. The skip is the real A4-printer check because no physical printer is available.
 - Logo snapshot tests: `2 passed` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_logo_snapshot.py -q`.
-- Full suite: **`137 passed, 1 skipped`** — `.venv\Scripts\python.exe -m pytest -q` (run 2026-11-17, project-local `.venv`, Python 3.12.10, pytest 9.2.0, PySide6-Essentials 6.12.0).
+- Font package/embedding tests: `3 passed` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_fonts.py -q`.
+- Full suite: **`140 passed, 1 skipped`** — `.venv\Scripts\python.exe -m pytest -q` (run 2026-11-17, project-local `.venv`, Python 3.12.10, pytest 9.2.0, PySide6-Essentials 6.12.0).
 - The older quotation issue tests still use a test-double export row; the rendering tests exercise the real renderer/export/PDF path.
 
 ### Implementation notes / deviations
@@ -97,16 +108,15 @@ Concrete defects found and fixed in this check:
 - The quote status is **not** changed when a conversion draft is created (per 05 §3.2); it becomes `CONVERTED` only when the sale is posted. Restoration therefore usually records the unchanged status; if the status changed while the draft existed, the saved `status_before_conversion` is restored unless the quotation has expired.
 - `document_snapshots` is immutable (trigger) and unique per `(document_type, document_id)`. The official export row is inserted in the same transaction as the snapshot and `ISSUED` status.
 - `document_exports` metadata now has a real file behind it for official quotation PDFs; reprint/print verify the stored SHA-256.
-- The renderer uses the installed system font `Microsoft Sans Serif` as a platform compatibility fallback (candidate list: Microsoft Sans Serif/Tahoma/Arial). No font file is bundled and no brand/identity font is approved. T-DOC-005 remains open.
-- Store identity may be absent until the store profile is configured; logo/font remain deliberately unbundled (`OQ-DOC-002`).
+- The renderer uses the bundled Noto Naskh Arabic 2.000 (OFL 1.1) Regular/Bold faces. No system Arabic font is used; required ligatures are disabled for PDF text extraction. T-DOC-005 is covered.
+- The logo asset is not bundled; a configured logo is copied into managed content-addressed storage and recorded in the snapshot. Logo rendering/branding remains open (`OQ-DOC-002`).
 - Revisions copy the source `issue_date`/`valid_until`; the draft can be edited before issuing. This is an implementation choice, not a new business approval.
-- No UI, Qt WebEngine, separate PDF library, real store logo asset, bundled font, or physical-printer acceptance test was added.
+- No UI, Qt WebEngine, separate PDF library, real store logo asset, golden image, or physical-printer acceptance test was added.
 
 ### What remains in Phase 7 (open)
 
-- **T-DOC-005:** approved/licensed Arabic font with embedding/re-distribution verification. The platform fallback is not an approved font.
 - **T-DOC-009:** real A4 printer test. The machine currently exposes only Microsoft Print to PDF, Microsoft XPS Document Writer, and Fax; **T-DOC-010** confirms Print to PDF is not a substitute.
-- **T-DOC-007:** golden image/reference template after font/template approval.
+- **T-DOC-007:** golden image/reference template after the owner reviews and approves the template.
 - **Logo rendering/branding and approved logo identity** remain open (`OQ-DOC-002`). The snapshot/hash/reprint-stability portion of `T-QUO-019`/`AC-QUO-003` is covered with synthetic logo assets; no real logo was added.
 - The full Phase 7 exit criteria in `docs/11_IMPLEMENTATION_ROADMAP.md` remain unchanged. **Phase 8 must not start until they all pass.**
 
@@ -174,7 +184,7 @@ Note: `T-DB-003/004/005/006/007/008/009/012` are inventory/accounting DB invaria
 | `OQ-SAL-003` / mixed or partial cash | 2. Deferred feature | Phase 6 exit criteria/tests do not require mixed/partial cash; the approved recommendation assumes cash = full payment and the service rejects `MIXED`. Not a Phase 6 exit blocker. |
 | `T-DB-001/002` | 3. Later-phase test — now covered in Phase 7 partial | Quotation conversion/`source_quotation_id`, owned by Phase 7. Removed from the Phase 6 test list; covered headlessly by the Phase 7 tests. |
 | `T-SEC-008` | 3. Later-phase requirement | Audit-log viewing is Phase 9. |
-| Phase 7 gate | 2. In progress — partial | Phase 6 gate passed 2026-11-17. Phase 7 quotation core and the approved ADR-0004 Option B renderer are implemented/tested; `OQ-QUO-001/005` and `OQ-DOC-001` were resolved 2026-11-17. T-DOC-005 (font), T-DOC-009 (real printer), and T-DOC-007 (golden) remain open, and `OQ-DOC-002` remains deferred, so the full Phase 7 gate has not passed and Phase 8 remains blocked. |
+| Phase 7 gate | 2. In progress — partial | Phase 6 gate passed 2026-11-17. Phase 7 quotation core, approved ADR-0004 Option B renderer, and approved Noto Naskh Arabic font are implemented/tested; `OQ-QUO-001/005` and `OQ-DOC-001` were resolved 2026-11-17. T-DOC-009 (real printer), T-DOC-007 (golden), and logo identity remain open, so the full Phase 7 gate has not passed and Phase 8 remains blocked. |
 
 ## Resolved Phase 6 decisions
 
@@ -202,9 +212,9 @@ Keep `SALE_RETURN_IN` then `DAMAGE` in one transaction; post the captured damage
 - Deferred / open decisions:
   - `OQ-INV-007` `ADJUSTMENT_IN` — **deferred feature; not a Phase 6 exit blocker.** The posting service remains unimplemented because the cost basis is OPEN (explicit/FIFO/other/zero); no basis was invented. It is not in the Phase 6 dependencies, outputs, exit criteria, or test list.
   - `OQ-SAL-003` mixed/partial cash payment — **deferred feature; not a Phase 6 exit blocker.** The approved recommendation assumes cash = full payment; `MIXED` is rejected at the service boundary. It is not required by Phase 6 exit tests.
-  - Phase 7: **IN PROGRESS — PARTIAL.** Phase 6 gate passed 2026-11-17. Quotation core and the approved ADR-0004 Option B renderer (QTextDocument/QTextTable + custom paginator, Qt PDF/print) are implemented and tested. `OQ-QUO-001/005` and `OQ-DOC-001` were resolved 2026-11-17. T-DOC-005 (approved/licensed font), T-DOC-009 (real A4 printer), and T-DOC-007 (golden image) remain open; `OQ-DOC-002` remains deferred (logo/font; no font bundled).
-  - A4/PDF/UI/real-printer checks: PDF/A4/text extraction/pagination are now covered by the rendering tests; physical-printer output, font licensing/embedding, golden images, and logo behaviour remain deferred/open for Phase 7.
+  - Phase 7: **IN PROGRESS — PARTIAL.** Phase 6 gate passed 2026-11-17. Quotation core, the approved ADR-0004 Option B renderer, and the approved Noto Naskh Arabic font are implemented and tested. `OQ-QUO-001/005` and `OQ-DOC-001` were resolved 2026-11-17. T-DOC-009 (real A4 printer), T-DOC-007 (golden image), and logo identity/branding remain open; `OQ-DOC-002` remains deferred for the logo only.
+  - A4/PDF/UI/real-printer checks: PDF/A4/text extraction/pagination/font embedding are covered by tests; physical-printer output, golden images, and logo behaviour remain deferred/open for Phase 7.
 - True Phase 6 exit blockers: **none**.
 - Deferred features, not Phase 6 exit blockers: `OQ-INV-007` (`ADJUSTMENT_IN`) and `OQ-SAL-003` (mixed/partial cash).
 - Later-phase items: `T-DB-001/002` are Phase 7 quotation-schema tests and are now covered headlessly; `T-SEC-008` is Phase 9 audit-log work. Phase 7 is in progress/partial, not complete.
-- Next: resolve T-DOC-005 (approved/licensed Arabic font and embedding rights), T-DOC-009 (real A4 printer test), and T-DOC-007 (golden image after template/font approval); `OQ-DOC-002` logo/font remains deferred. Phase 8 must not start until the full Phase 7 gate passes. `OQ-INV-007` and `OQ-SAL-003` remain deferred.
+- Next: resolve T-DOC-009 (real A4 printer test), T-DOC-007 (golden image after owner template approval), and logo identity/branding (`OQ-DOC-002`); the Arabic font is approved and bundled. Phase 8 must not start until the full Phase 7 gate passes. `OQ-INV-007` and `OQ-SAL-003` remain deferred.

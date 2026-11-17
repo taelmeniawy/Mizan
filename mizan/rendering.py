@@ -4,9 +4,9 @@ ADR-0004 Option B: QTextDocument + QTextTable with a focused paginator, using
 Qt for both PDF output (QPdfWriter) and printing (QPrinter).  The same page
 composer builds every page for both output paths.
 
-No font is bundled and no brand font is selected.  The renderer uses the
-platform's general system font unless a family is supplied by the caller;
-font licensing/approval remains OQ-DOC-002 / T-DOC-005 work.
+The renderer loads the bundled, owner-approved Noto Naskh Arabic font (SIL OFL
+1.1, pinned source) from package resources.  No system font is used for
+documents.  The logo decision remains open under OQ-DOC-002.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from __future__ import annotations
 import unicodedata
 from dataclasses import dataclass
 from decimal import Decimal
+from importlib.resources import as_file, files
 from pathlib import Path
 
 from PySide6.QtCore import QMarginsF, QRectF, Qt
@@ -50,9 +51,19 @@ FOOTER_HEIGHT_PT = 22.0
 BODY_HEIGHT_PT = CONTENT_HEIGHT_PT - FOOTER_HEIGHT_PT - 4.0
 
 TEMPLATE_VERSION = "A4-QUOTATION-V1"
-RENDERER_VERSION = "PySide6-QTextDocument-QTextTable-Paginator/1"
+RENDERER_VERSION = "PySide6-QTextDocument-QTextTable-Paginator/2"
+
+BUNDLED_FONT_FAMILY = "Noto Naskh Arabic"
+BUNDLED_FONT_VERSION = "2.000"
+BUNDLED_FONT_LICENSE = "OFL-1.1"
+BUNDLED_FONT_DIR = "assets/fonts/NotoNaskhArabic"
+BUNDLED_FONT_FILES = (
+    "NotoNaskhArabic-Regular.ttf",
+    "NotoNaskhArabic-Bold.ttf",
+)
 
 _APP: QGuiApplication | None = None
+_BUNDLED_FONT_LOADED = False
 
 _ALIGN_RIGHT = Qt.AlignRight | Qt.AlignAbsolute
 _ALIGN_LEFT = Qt.AlignLeft | Qt.AlignAbsolute
@@ -64,17 +75,53 @@ class RendererError(ValueError):
 
 
 def ensure_qt_app() -> QGuiApplication:
-    """Create/reuse the Qt application and ensure a system font database."""
+    """Create/reuse the Qt application required by text and print services."""
     global _APP
     if QGuiApplication.instance() is None:
         _APP = QGuiApplication([])
-    app = QGuiApplication.instance()
-    if not QFontDatabase.families():
-        raise RendererError(
-            "Qt has no system font database; Arabic rendering needs a Windows "
-            "font database. Do not use QT_QPA_PLATFORM=offscreen in this environment."
-        )
-    return app
+    return QGuiApplication.instance()
+
+
+def bundled_font_dir():
+    """Return the packaged font directory as an importlib resource."""
+    return files("mizan").joinpath(*BUNDLED_FONT_DIR.split("/"))
+
+
+def load_bundled_fonts() -> str:
+    """Load the pinned Noto Naskh Arabic regular/bold faces from package data."""
+    global _BUNDLED_FONT_LOADED
+    ensure_qt_app()
+    if _BUNDLED_FONT_LOADED:
+        return BUNDLED_FONT_FAMILY
+    font_dir = bundled_font_dir()
+    for filename in BUNDLED_FONT_FILES:
+        resource = font_dir.joinpath(filename)
+        if not resource.is_file():
+            raise RendererError(
+                f"bundled font is missing from package data: {BUNDLED_FONT_DIR}/{filename}"
+            )
+        with as_file(resource) as path:
+            font_id = QFontDatabase.addApplicationFont(str(path))
+        if font_id < 0:
+            raise RendererError(f"Qt could not load bundled font: {filename}")
+        families = QFontDatabase.applicationFontFamilies(font_id)
+        if BUNDLED_FONT_FAMILY not in families:
+            raise RendererError(
+                f"bundled font family is not {BUNDLED_FONT_FAMILY!r}: {families!r}"
+            )
+    if BUNDLED_FONT_FAMILY not in QFontDatabase.families():
+        raise RendererError("bundled Noto Naskh Arabic family is not available to Qt")
+    _BUNDLED_FONT_LOADED = True
+    return BUNDLED_FONT_FAMILY
+
+
+def default_platform_font_family() -> str:
+    """Return the bundled document font family.
+
+    Kept under the old name for compatibility with earlier callers; documents
+    now always use the approved bundled font.
+    """
+    return load_bundled_fonts()
 
 
 def format_egp(piastres: int) -> str:
@@ -110,21 +157,6 @@ def normalize_arabic(text: str) -> str:
     return normalized
 
 
-def default_platform_font_family() -> str:
-    """Pick an installed system font with reliable Arabic shaping/PDF text.
-
-    This is a platform compatibility fallback, not an approved brand font or
-    a bundled asset.  OQ-DOC-002 / T-DOC-005 remain open until a licensed font
-    is approved.
-    """
-    ensure_qt_app()
-    available = set(QFontDatabase.families())
-    for candidate in ("Microsoft Sans Serif", "Tahoma", "Arial"):
-        if candidate in available:
-            return candidate
-    return QFontDatabase.systemFont(QFontDatabase.GeneralFont).family()
-
-
 @dataclass(frozen=True)
 class RenderResult:
     pages: int
@@ -141,7 +173,12 @@ class PagePlan:
 class A4QuotationRenderer:
     def __init__(self, *, font_family: str | None = None, base_font_pt: float = 9.0):
         ensure_qt_app()
-        self._font_family = font_family or default_platform_font_family()
+        bundled_family = load_bundled_fonts()
+        if font_family is not None and font_family != bundled_family:
+            raise RendererError(
+                f"only the approved bundled font {bundled_family!r} may be used"
+            )
+        self._font_family = bundled_family
         self._base_font_pt = base_font_pt
         self._table_headers = (
             "الصافي (EGP)", "خصم (EGP)", "سعر الوحدة (EGP)",
@@ -160,6 +197,11 @@ class A4QuotationRenderer:
             font = QFontDatabase.systemFont(QFontDatabase.GeneralFont)
         font.setPointSizeF(size if size is not None else self._base_font_pt)
         font.setBold(bold)
+        # Noto Naskh Arabic's required ligatures (rlig) use glyphs that Qt
+        # 6.12's PDF writer does not map in ToUnicode, which breaks Arabic PDF
+        # text extraction.  Disabling rlig keeps Arabic contextual shaping
+        # (init/medi/fina) and restores a complete searchable/copyable text layer.
+        font.setFeature(QFont.Tag("rlig"), 0)
         return font
 
     def _char_format(self, size: float | None = None, *, bold: bool = False) -> QTextCharFormat:

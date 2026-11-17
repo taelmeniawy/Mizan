@@ -70,6 +70,15 @@ Fix: added `format_egp_amount()` (piastres → two-decimal EGP amount without su
 
 Regression tests in `tests/test_phase7_line_amounts.py` cover line 1 net `12.50`, line 2 discount/net `1.00 / 21.13`, lines 21 and 42 net `52.00`, and reconciliation of line discounts/nets with the invoice summary. The re-rendered synthetic review quotation keeps 3 pages with 20/20/5 rows; its line 42 shows `51.00` because that preview row carries a `1.00` discount. The preview remains review-only, not a golden reference.
 
+### Summary direction fix and separator verification (2026-11-17)
+
+- **Confirmed defect:** in the RTL totals block, `1,281.41 EGP` was reordered to `EGP 1,281.41`; the amount resolved as an Arabic-context number while the Latin `EGP` token drifted to the far left, so the currency read as a prefix and the extracted order was unstable.
+- **Fix:** `_totals_line()` in `mizan/rendering.py` inserts `<label>: <amount> EGP` with U+200E left-to-right marks around the money token so it renders as one LTR run. The table is unchanged: cells stay bare numbers under the `(EGP)` column headers, and no currency suffix is duplicated in cells.
+- **Verified:** extracted text keeps `<amount> EGP` and never `EGP <amount>`; no bidi control characters reach the copyable text; pages 1–2 of the 45-line preview are identical to the baseline after normalization; numeric tokens are identical on all three pages; pagination stays 20/20/5.
+- **Separator investigation:** the PDF text layer uses ASCII `.` everywhere (`28.88` present, `28,88` absent, no U+066B/U+066C, no Arabic-Indic digits). Rendering the same cells at 96 dpi reproduces the comma-like appearance — the Tahoma 8.2 pt period is about one pixel and anti-aliasing merges it with adjacent digits — while at 300 dpi it is a distinct dot. The cause is raster resolution, not formatting, locale, or localized substitution: `locl=0` was **not** added, and no font, size, or money format was changed. Review page images are now rendered at 300 dpi grayscale.
+- **Versions:** `RENDERER_VERSION` bumped to `PySide6-QTextDocument-QTextTable-Paginator/3`; `TEMPLATE_VERSION` stays `A4-QUOTATION-V1` because the template elements, column order, and pagination are unchanged and the template is still awaiting owner approval.
+- **Review artifacts:** candidate PDF/page images are `artifacts/phase7-review/mizan-phase7-review-candidate.pdf` and `page-0N-candidate.png`; the previous preview is retained as the baseline. These are untracked review artifacts and are not committed.
+
 ### Approved Arabic font — Noto Naskh Arabic (2026-11-17)
 
 - **Source/version/license:** Noto Naskh Arabic 2.000, SIL OFL 1.1, pinned upstream commit `8386d579f0fc5064dc8b66c6b5a9382f3822b82d` (`notofonts/NotoNaskhArabic`). Regular and Bold hinted TTF instances are bundled at `mizan/assets/fonts/NotoNaskhArabic/` with the upstream `LICENCE` and a `SOURCE.md` containing source URLs, version, and SHA-256 hashes.
@@ -109,9 +118,9 @@ Concrete defects found and fixed in this check:
 - Phase 7 rendering tests: `10 passed, 1 skipped` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_rendering.py -q`. The skip is the real A4-printer check because no physical printer is available.
 - Logo snapshot tests: `2 passed` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_logo_snapshot.py -q`.
 - Font package/embedding tests: `3 passed` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_fonts.py -q`.
-- Line-amount regression tests: `3 passed` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_line_amounts.py -q`.
+- Line-amount and summary-format tests: `6 passed` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_line_amounts.py -q` (per-line values, extracted summary order/isolation, two-decimal ASCII separators, totals reconciliation).
 - Focused line-amount/rendering/quotation run: `37 passed, 1 skipped` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_line_amounts.py tests/test_phase7_rendering.py tests/test_phase7_quotations.py -q`.
-- Full suite: **`143 passed, 1 skipped`** — `.venv\Scripts\python.exe -m pytest -q` (run 2026-11-17, project-local `.venv`, Python 3.12.10, pytest 9.2.0, PySide6-Essentials 6.12.0).
+- Full suite: **`146 passed, 1 skipped`** — `.venv\Scripts\python.exe -m pytest -q` (run 2026-11-17 after the summary fix, project-local `.venv`, Python 3.12.10, pytest 9.2.0, PySide6-Essentials 6.12.0). The skip is the physical A4-printer check; T-DOC-009 remains open.
 - The older quotation issue tests still use a test-double export row; the rendering tests exercise the real renderer/export/PDF path.
 
 ### Implementation notes / deviations

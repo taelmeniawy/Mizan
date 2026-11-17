@@ -7,6 +7,8 @@ as 0.00; the summary was correct.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from PySide6.QtGui import QTextTable
 
@@ -15,8 +17,9 @@ from mizan.rendering import (
     RENDERER_VERSION,
     TEMPLATE_VERSION,
     format_egp,
+    format_egp_amount,
 )
-from pdf_probe import read_pdf
+from pdf_probe import normalize_arabic, read_pdf
 from phase7_support import build_quote_shop
 
 
@@ -128,3 +131,82 @@ def test_pdf_amounts_render_and_keep_pagination(amount_snapshot, tmp_path):
     assert "1.00" in report.text
     assert "21.13" in report.text
     assert report.text.count("52.00") >= 2
+
+
+def _summary_text(renderer: A4QuotationRenderer, snapshot: dict, tmp_path) -> str:
+    output = tmp_path / "summary-format.pdf"
+    renderer.render_pdf(snapshot, output)
+    report = read_pdf(output)
+    return normalize_arabic(report.page_texts[-1])
+
+
+def test_summary_amounts_follow_labels_in_one_ltr_run(amount_snapshot, tmp_path):
+    """The RTL paragraph must not reorder the totals or their currency.
+
+    The amount is inserted with its currency as one direction-isolated LTR
+    run, so extracted text keeps "<amount> EGP" and never "EGP <amount>".
+    """
+    renderer, snapshot = amount_snapshot
+    text = _summary_text(renderer, snapshot, tmp_path)
+    totals = snapshot["totals"]
+    pairs = (
+        ("الإجمالي قبل الخصم", totals["subtotal_piastres"]),
+        ("خصم البنود", totals["item_discount_piastres"]),
+        ("خصم العرض", totals["invoice_discount_piastres"]),
+        ("الإجمالي المستحق", totals["total_piastres"]),
+    )
+
+    # Isolation must not leak bidi control characters into copyable text.
+    assert "\u200e" not in text
+    assert "\u200f" not in text
+    for label, piastres in pairs:
+        token = f"{format_egp_amount(piastres)} EGP"
+        assert token in text, (label, token)
+        assert f"EGP {token.split(' ')[0]}" not in text, (label, token)
+        assert re.search(re.escape(token) + r"\s+" + re.escape(label), text), (
+            label,
+            token,
+        )
+
+
+def test_money_values_keep_two_ascii_decimals(amount_snapshot, tmp_path):
+    renderer, snapshot = amount_snapshot
+    output = tmp_path / "money-format.pdf"
+    renderer.render_pdf(snapshot, output)
+    text = normalize_arabic(read_pdf(output).text)
+
+    # No Arabic separators and no comma used as a decimal separator.
+    assert "\u066b" not in text
+    assert "\u066c" not in text
+    assert re.search(r"\d,\d{2}(?!\d)", text) is None
+    # Every currency token is a two-decimal ASCII amount followed by EGP.
+    tokens = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2} EGP", text)
+    assert len(tokens) >= 4
+    for token in tokens:
+        assert re.fullmatch(r"\d{1,3}(?:,\d{3})*\.\d{2} EGP", token)
+    # Per-line values are unchanged by the summary fix.
+    for value in ("12.50", "21.13", "52.00"):
+        assert value in text
+
+
+def test_rendered_totals_still_reconcile_with_line_amounts(amount_snapshot, tmp_path):
+    renderer, snapshot = amount_snapshot
+    lines = snapshot["lines"]
+    totals = snapshot["totals"]
+    item_discount = sum(line["item_discount_piastres"] for line in lines)
+    invoice_discount = sum(line["invoice_discount_alloc_piastres"] for line in lines)
+    net = sum(line["net_piastres"] for line in lines)
+
+    assert totals["item_discount_piastres"] == item_discount
+    assert totals["invoice_discount_piastres"] == invoice_discount
+    assert totals["total_piastres"] == net
+    assert totals["subtotal_piastres"] == net + item_discount + invoice_discount
+
+    text = _summary_text(renderer, snapshot, tmp_path)
+    for key in (
+        "subtotal_piastres",
+        "item_discount_piastres",
+        "invoice_discount_piastres",
+        "total_piastres",
+    ):
+        assert f"{format_egp_amount(totals[key])} EGP" in text

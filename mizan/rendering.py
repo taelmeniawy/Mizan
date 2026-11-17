@@ -51,7 +51,7 @@ FOOTER_HEIGHT_PT = 22.0
 BODY_HEIGHT_PT = CONTENT_HEIGHT_PT - FOOTER_HEIGHT_PT - 4.0
 
 TEMPLATE_VERSION = "A4-QUOTATION-V1"
-RENDERER_VERSION = "PySide6-QTextDocument-QTextTable-Paginator/2"
+RENDERER_VERSION = "PySide6-QTextDocument-QTextTable-Paginator/3"
 
 BUNDLED_FONT_FAMILY = "Noto Naskh Arabic"
 BUNDLED_FONT_VERSION = "2.000"
@@ -68,6 +68,14 @@ _BUNDLED_FONT_LOADED = False
 _ALIGN_RIGHT = Qt.AlignRight | Qt.AlignAbsolute
 _ALIGN_LEFT = Qt.AlignLeft | Qt.AlignAbsolute
 _ALIGN_CENTER = Qt.AlignHCenter | Qt.AlignVCenter
+
+# Left-to-right mark (U+200E).  Totals are inserted into right-to-left
+# paragraphs, where a bare "<amount> EGP" sequence is otherwise split by the
+# bidi algorithm: the digits resolve as an Arabic-context number while the
+# Latin "EGP" drifts to the far left, so the currency reads as a prefix and the
+# token order is not stable.  The marks keep the amount and its currency one
+# LTR run ("1,281.41 EGP") without adding visible characters or fonts.
+_LRM = "\u200e"
 
 
 class RendererError(ValueError):
@@ -342,6 +350,21 @@ class A4QuotationRenderer:
                 cell_cursor.insertText(value, body_char)
         return table
 
+    def _totals_line(self, cursor: QTextCursor, label: str, piastres: int, *,
+                     size: float, bold: bool = False,
+                     top: float = 0.0, bottom: float = 0.0) -> None:
+        """Insert one totals line with a direction-isolated LTR money run.
+
+        The label stays right-to-left; the amount and its currency are wrapped
+        in LRM so they render as one left-to-right token ("1,281.41 EGP")
+        instead of being reordered by the surrounding RTL paragraph.
+        """
+        self._insert_paragraph(
+            cursor,
+            f"{label}: {_LRM}{format_egp(piastres)}{_LRM}",
+            size=size, bold=bold, alignment=_ALIGN_RIGHT, top=top, bottom=bottom,
+        )
+
     def _summary(self, cursor: QTextCursor, snapshot: dict) -> None:
         totals = snapshot.get("totals") or {}
         cursor.movePosition(QTextCursor.End)
@@ -352,14 +375,10 @@ class A4QuotationRenderer:
             ("خصم العرض", int(totals.get("invoice_discount_piastres", 0))),
         )
         for label, value in lines:
-            self._insert_paragraph(
-                cursor, f"{label}: {format_egp(value)}", size=8.5,
-                alignment=_ALIGN_RIGHT,
-            )
-        self._insert_paragraph(
-            cursor,
-            f"الإجمالي المستحق: {format_egp(int(totals.get('total_piastres', 0)))}",
-            size=10, bold=True, alignment=_ALIGN_RIGHT, top=2, bottom=2,
+            self._totals_line(cursor, label, value, size=8.5)
+        self._totals_line(
+            cursor, "الإجمالي المستحق", int(totals.get("total_piastres", 0)),
+            size=10, bold=True, top=2, bottom=2,
         )
         if snapshot.get("notes"):
             self._insert_paragraph(cursor, f"ملاحظات: {snapshot['notes']}", size=8.5,

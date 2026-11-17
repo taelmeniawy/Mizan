@@ -96,6 +96,26 @@ def consume_lot_layers(conn, lot_id: int, quantity: int, reel_id: int | None = N
     return result
 
 
+def available_stock(conn, product) -> int:
+    """Return sellable base-quantity on hand for a LOT/REEL product."""
+    if product["tracking_mode"] == "LOT":
+        return int(conn.execute(
+            "SELECT COALESCE(SUM(l.remaining_qty_micros),0) FROM inventory_cost_layers l "
+            "JOIN purchase_lots p ON p.id=l.lot_id "
+            "WHERE p.product_id=? AND l.reel_id IS NULL AND l.status='OPEN' "
+            "AND l.remaining_qty_micros>0",
+            (product["id"],),
+        ).fetchone()[0])
+    return int(conn.execute(
+        "SELECT COALESCE(SUM(l.remaining_qty_micros),0) FROM inventory_cost_layers l "
+        "JOIN purchase_lots p ON p.id=l.lot_id "
+        "JOIN reels r ON r.id=l.reel_id "
+        "WHERE p.product_id=? AND l.reel_id IS NOT NULL AND l.status='OPEN' "
+        "AND l.remaining_qty_micros>0 AND r.status NOT IN ('DAMAGED','RETURNED')",
+        (product["id"],),
+    ).fetchone()[0])
+
+
 def refresh_lot_status(conn, lot_id: int) -> None:
     remaining = conn.execute(
         "SELECT COALESCE(SUM(remaining_qty_micros),0) FROM inventory_cost_layers WHERE lot_id=?",

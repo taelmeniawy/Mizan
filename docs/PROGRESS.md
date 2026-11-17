@@ -1,6 +1,6 @@
 # Progress
 
-- Phase: 6 complete — sales, receipts/credits, and sellable/damaged sales returns implemented and tested; phases 1–6 complete. Phase 7 not started (own dependencies unresolved).
+- Phase: **7 in progress — partial.** Phases 1–6 are complete. Phase 7's renderer-independent quotation core is implemented and tested, but Phase 7 is **not complete**: ADR-0004 remains PROPOSED / NEEDS APPROVAL and the PDF/A4/printer acceptance criteria remain open. Phase 8 has not started and remains gated on the full Phase 7 gate.
 - Done:
   - Phase 6 sales invoices: retail/wholesale/contractor, cash/credit, DRAFT edit/cancel, POSTED immutability, reversal record.
   - Price resolver priority customer price → price list → default; manual price source/reason; line and invoice discounts with largest-remainder allocation.
@@ -20,6 +20,56 @@
   - Migration 5 adds sales, sales lines/status history, receipts/allocations, returns/lines/selection rows, customer credits/applications, and posted-document immutability triggers; migration 6 adds returned-reel source links (`source_reel_id`, `source_issue_allocation_id`) and indexes.
   - Shared inventory ledger extracted to `mizan/inventory.py`; purchasing now reuses it, preserving existing FIFO/reel behaviour.
 - Tests: 101 passed, 0 failed (57 Phase 6 tests + 44 other/pre-existing), run 2026-11-17 in the project-local `.venv` (Python 3.12.10, pytest 9.2.0). Command: `.venv\Scripts\python.exe -m pytest -q`. Pytest is declared under `[project.optional-dependencies] dev`; PyPI was unreachable during setup, so the venv was bootstrapped from an existing local pytest installation. No global Python was modified.
+
+## Phase 7 — partial (2026-11-17)
+
+**Status: IN PROGRESS — PARTIAL. Renderer-independent quotation core implemented; PDF/A4/printer and document-identity work remains open.**
+
+### Resolved decisions applied
+
+The general owner instruction to adopt documented OQ recommendations was applied to the three Phase 7 OQs below; current source documents showed no conflict. The related `OQ-DOC-002` item remains deferred.
+
+- **`OQ-QUO-001` — conversion-draft cancellation/restoration:** `status_before_conversion` is recorded in `quotation_status_history`. Cancelling a conversion draft restores the saved status only when the quotation has not expired; an expired quotation stays expired and a new conversion requires `override_expired_quotation` and a reason.
+- **`OQ-QUO-005` — cancellation policy:** `DRAFT` and `ISSUED` quotations can be cancelled with `cancel_quotation` and a recorded reason; an `ACCEPTED` quotation cannot be cancelled; `REJECTED`/`CANCELLED`/`SUPERSEDED`/`CONVERTED` are final.
+- **`OQ-DOC-001` — document numbering:** `{TYPE}-{YYYY}-{NNNNNN}` per type/year from a database sequence; committed numbers are unique and not reused; gaps are allowed only on transaction failure. Quotation roots use `Q-YYYY-NNNNNN`; revisions add `-R{version_no}`.
+- **`OQ-DOC-002` — deferred, not applied:** logo/font selection remains open and blocks release/document identity, not quotation-core development. No logo asset or font was added or bundled.
+
+### Implemented (renderer-independent)
+
+- Migration 7 adds `quotation_series`, `quotations`, `quotation_lines`, `quotation_status_history`, `document_exports`, `document_snapshots`, `sales.source_quotation_id`, the partial unique index `ux_sales_source_quotation_active`, and immutability/root/issuance triggers.
+- `QuotationService` covers create/edit draft, line snapshots, price resolution and manual-price permission/reason, item/invoice discounts with largest remainder, issue/accept/reject/cancel, revisions and supersession, expiry computation (last day valid), conversion to a sales `DRAFT`, expired-conversion override, and conversion-draft cancellation/restoration.
+- Revision guard: no revision while an active (non-cancelled) sale exists in the series; only the latest version can be revised. Creating a revision does not supersede the previous version; issuing the revision does, in the same transaction.
+- Conversion copies the quotation's frozen quantities/prices/discounts and line snapshots, creates the sales `DRAFT` only, performs an advisory stock check without reservation, and never creates inventory movements or journals.
+- Duplicate-conversion prevention is enforced by `ux_sales_source_quotation_active` and tested directly against SQLite as well as through the service. Cancelling the draft releases the index.
+- Sale posting marks the quotation `CONVERTED` in the same transaction; a failed posting leaves it unchanged. Cancelling a conversion draft leaves the sale row cancelled (no delete) and restores the quotation status per `OQ-QUO-001`.
+- Quotation-generated sales drafts lock commercial fields; `update_draft_header` allows payment terms/account/due date/invoice date changes where the sales rules allow.
+- `DocumentService` records export metadata and immutable document snapshots. `issue_quotation` requires an already-registered **official PDF export**; without one it raises a clear ADR-0004 prerequisite error. No PDF is generated, hashed from a real file, extracted, measured, or printed.
+- Shared `pricing.py` and `inventory.available_stock` prevent quotation/sales logic from drifting.
+
+### Tests (actual result)
+
+- Phase 7 targeted: `24 passed` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_quotations.py -q`.
+- Full suite: **`125 passed, 0 failed`** — `.venv\Scripts\python.exe -m pytest -q` (run 2026-11-17, project-local `.venv`, Python 3.12.10, pytest 9.2.0).
+- The Phase 7 issue tests use a **test-double export row** (`renderer_version='TEST_DOUBLE_NO_RENDERER'`) only to reach `ISSUED`; they do not claim PDF/A4 validation. See `tests/phase7_support.py`.
+
+### Implementation notes / deviations
+
+- The quote status is **not** changed when a conversion draft is created (per 05 §3.2); it becomes `CONVERTED` only when the sale is posted. Restoration therefore usually records the unchanged status; if the status changed while the draft existed, the saved `status_before_conversion` is restored unless the quotation has expired.
+- `document_exports` records metadata only; file existence and real-file SHA-256 verification remain part of the open renderer/export gate.
+- `document_snapshots` is immutable (trigger) and unique per `(document_type, document_id)`.
+- Snapshot captures store/customer/project/lines/totals and export/template/renderer metadata when available. Store identity may be absent until configured; logo/font are deliberately not bundled (`OQ-DOC-002`).
+- Revisions copy the source `issue_date`/`valid_until`; the draft can be edited before issuing. This is an implementation choice, not a new business approval.
+- No renderer, UI, printer integration, logo/font asset, or new dependency was added.
+
+### What remains in Phase 7 (open)
+
+- **ADR-0004 is still PROPOSED / NEEDS APPROVAL.** No A4/PDF engine has been selected or implemented.
+- Official PDF generation, file movement, real-file SHA-256 verification, and reprint/missing-file behavior (`T-QUO-001/002/018`).
+- PDF text extraction, Arabic shaping/RTL, A4 dimensions, repeated table headers, row-splitting behavior, golden/pagination checks (`T-DOC-001..008`, `AC-QUO-020/021`).
+- Real A4 printer test; Microsoft Print to PDF does not substitute (`T-DOC-009/010`, `AC-QUO-022`).
+- Document identity: logo asset handling, font licensing, and bundling (`OQ-DOC-002`, `T-QUO-019`, `AC-QUO-003`).
+- The full Phase 7 exit criteria in `docs/11_IMPLEMENTATION_ROADMAP.md` remain unchanged. **Phase 8 must not start until they all pass.**
+
 
 ## Phase 6 acceptance checklist
 
@@ -82,9 +132,9 @@ Note: `T-DB-003/004/005/006/007/008/009/012` are inventory/accounting DB invaria
 | `OQ-INV-004` / `T-RET-002`, `T-RET-017` | Resolved — 2026-11-17 | Damaged flow + direct loss `5020/5010`; both accounting assertions covered. |
 | `OQ-INV-007` / `ADJUSTMENT_IN` | 2. Deferred feature | Not in the Phase 6 dependencies, outputs, exit criteria, or test list; `OQ-INV-007` is PROPOSED and its cost basis is OPEN. Not a Phase 6 exit blocker. |
 | `OQ-SAL-003` / mixed or partial cash | 2. Deferred feature | Phase 6 exit criteria/tests do not require mixed/partial cash; the approved recommendation assumes cash = full payment and the service rejects `MIXED`. Not a Phase 6 exit blocker. |
-| `T-DB-001/002` | 3. Later-phase test | Quotation conversion/`source_quotation_id`, owned by Phase 7. Removed from the Phase 6 test list. |
+| `T-DB-001/002` | 3. Later-phase test — now covered in Phase 7 partial | Quotation conversion/`source_quotation_id`, owned by Phase 7. Removed from the Phase 6 test list; covered headlessly by the Phase 7 tests. |
 | `T-SEC-008` | 3. Later-phase requirement | Audit-log viewing is Phase 9. |
-| Phase 7 gate | 3. Later phase | Phase 6 gate passed 2026-11-17; Phase 7 not started and blocked by its own dependencies (`ADR-0004`, `OQ-DOC-002`, `OQ-QUO-001/005`, `OQ-DOC-001`). |
+| Phase 7 gate | 2. In progress — partial | Phase 6 gate passed 2026-11-17. Phase 7 renderer-independent work is implemented/tested; `OQ-QUO-001/005` and `OQ-DOC-001` were resolved 2026-11-17. `ADR-0004` remains PROPOSED / NEEDS APPROVAL and `OQ-DOC-002` remains open, so the full Phase 7 gate has not passed and Phase 8 remains blocked. |
 
 ## Resolved Phase 6 decisions
 
@@ -112,9 +162,9 @@ Keep `SALE_RETURN_IN` then `DAMAGE` in one transaction; post the captured damage
 - Deferred / open decisions:
   - `OQ-INV-007` `ADJUSTMENT_IN` — **deferred feature; not a Phase 6 exit blocker.** The posting service remains unimplemented because the cost basis is OPEN (explicit/FIFO/other/zero); no basis was invented. It is not in the Phase 6 dependencies, outputs, exit criteria, or test list.
   - `OQ-SAL-003` mixed/partial cash payment — **deferred feature; not a Phase 6 exit blocker.** The approved recommendation assumes cash = full payment; `MIXED` is rejected at the service boundary. It is not required by Phase 6 exit tests.
-  - Phase 7: NOT started. Phase 6 gate passed 2026-11-17, but Phase 7 remains blocked by its own dependencies: `ADR-0004` (A4/PDF engine) is **PROPOSED / NEEDS APPROVAL**, `OQ-DOC-002` is open, and `OQ-QUO-001/005` and `OQ-DOC-001` still carry **PROPOSED** recommendations.
+  - Phase 7: **IN PROGRESS — PARTIAL.** Phase 6 gate passed 2026-11-17. Renderer-independent quotation lifecycle/status history, revisions/root links, conversion + DB duplicate guard, cancellation/restoration, numbering, and snapshot/export model are implemented and tested. `OQ-QUO-001/005` and `OQ-DOC-001` were resolved 2026-11-17 by adopting the documented recommendations. `ADR-0004` remains **PROPOSED / NEEDS APPROVAL** and `OQ-DOC-002` remains open/deferred (logo/font; no font bundled).
   - A4/PDF/UI/real-printer checks remain deferred for Phase 7: A4 dimensions, Arabic shaping, PDF text extraction, physical printer output, print scaling/alignment, and logo/font snapshot behaviour.
 - True Phase 6 exit blockers: **none**.
 - Deferred features, not Phase 6 exit blockers: `OQ-INV-007` (`ADJUSTMENT_IN`) and `OQ-SAL-003` (mixed/partial cash).
-- Later-phase items: `T-DB-001/002` are Phase 7 quotation-schema tests; `T-SEC-008` is Phase 9 audit-log work. Phase 7 remains unstarted.
-- Next: resolve Phase 7's own dependencies (`ADR-0004`, `OQ-DOC-002`, `OQ-QUO-001/005`, `OQ-DOC-001`) before starting Phase 7. `OQ-INV-007` and `OQ-SAL-003` remain deferred; `T-DB-001/002` remain Phase 7.
+- Later-phase items: `T-DB-001/002` are Phase 7 quotation-schema tests and are now covered headlessly; `T-SEC-008` is Phase 9 audit-log work. Phase 7 is in progress/partial, not complete.
+- Next: resolve `ADR-0004` (A4/PDF engine) and `OQ-DOC-002` (logo/font), then implement/validate official PDF export, PDF text extraction, A4 dimensions, and a real A4 printer. Phase 8 must not start until the full Phase 7 gate passes. `OQ-INV-007` and `OQ-SAL-003` remain deferred.

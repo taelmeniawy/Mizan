@@ -828,6 +828,208 @@ MIGRATIONS: list[Migration] = [
         CREATE INDEX ix_reels_source_issue_alloc ON reels(source_issue_allocation_id);
         """,
     ),
+    Migration(
+        7,
+        "quotations_and_document_model",
+        """
+        CREATE TABLE document_exports (
+            id INTEGER PRIMARY KEY,
+            document_type TEXT NOT NULL CHECK (document_type IN (
+                'QUOTATION','SALES_INVOICE','PURCHASE_DOC','STATEMENT','REPORT'
+            )),
+            document_id INTEGER NOT NULL CHECK (document_id > 0),
+            export_type TEXT NOT NULL CHECK (export_type IN ('PDF','PRINT')),
+            relative_path TEXT NOT NULL CHECK (length(trim(relative_path)) > 0),
+            sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+            file_size INTEGER NOT NULL CHECK (file_size >= 0),
+            template_version TEXT NOT NULL CHECK (length(trim(template_version)) > 0),
+            renderer_version TEXT NOT NULL CHECK (length(trim(renderer_version)) > 0),
+            generated_by INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+            generated_at TEXT NOT NULL,
+            is_official INTEGER NOT NULL DEFAULT 0 CHECK (is_official IN (0,1))
+        );
+        CREATE INDEX ix_document_exports_document
+            ON document_exports(document_type, document_id);
+        CREATE UNIQUE INDEX ux_document_exports_official
+            ON document_exports(document_type, document_id)
+            WHERE is_official = 1;
+
+        CREATE TABLE quotation_series (
+            id INTEGER PRIMARY KEY,
+            base_no TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE quotations (
+            id INTEGER PRIMARY KEY,
+            document_no TEXT NOT NULL UNIQUE,
+            series_id INTEGER NOT NULL REFERENCES quotation_series(id) ON DELETE RESTRICT,
+            root_quotation_id INTEGER REFERENCES quotations(id) ON DELETE RESTRICT,
+            version_no INTEGER NOT NULL CHECK (version_no >= 1),
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+            project_id INTEGER REFERENCES projects(id) ON DELETE RESTRICT,
+            price_list_id INTEGER REFERENCES price_lists(id) ON DELETE RESTRICT,
+            status TEXT NOT NULL DEFAULT 'DRAFT' CHECK (status IN (
+                'DRAFT','ISSUED','ACCEPTED','REJECTED','CANCELLED','SUPERSEDED','CONVERTED'
+            )),
+            issue_date TEXT NOT NULL,
+            valid_until TEXT,
+            subtotal_piastres INTEGER NOT NULL DEFAULT 0 CHECK (subtotal_piastres >= 0),
+            item_discount_piastres INTEGER NOT NULL DEFAULT 0 CHECK (item_discount_piastres >= 0),
+            invoice_discount_piastres INTEGER NOT NULL DEFAULT 0 CHECK (invoice_discount_piastres >= 0),
+            total_piastres INTEGER NOT NULL DEFAULT 0 CHECK (total_piastres >= 0),
+            notes TEXT,
+            terms TEXT,
+            official_export_id INTEGER REFERENCES document_exports(id) ON DELETE RESTRICT,
+            cancellation_reason TEXT,
+            created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            issued_at TEXT,
+            converted_at TEXT,
+            UNIQUE (series_id, version_no),
+            CHECK (total_piastres = subtotal_piastres - item_discount_piastres - invoice_discount_piastres),
+            CHECK (item_discount_piastres <= subtotal_piastres),
+            CHECK (invoice_discount_piastres <= subtotal_piastres - item_discount_piastres)
+        );
+        CREATE INDEX ix_quotations_customer_status ON quotations(customer_id, status);
+        CREATE INDEX ix_quotations_root ON quotations(root_quotation_id);
+
+        CREATE TABLE quotation_lines (
+            id INTEGER PRIMARY KEY,
+            quotation_id INTEGER NOT NULL REFERENCES quotations(id) ON DELETE RESTRICT,
+            line_no INTEGER NOT NULL,
+            product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+            unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE RESTRICT,
+            quantity_micros INTEGER NOT NULL CHECK (quantity_micros > 0),
+            base_qty_micros INTEGER NOT NULL CHECK (base_qty_micros > 0),
+            original_unit_price_micros INTEGER NOT NULL CHECK (original_unit_price_micros >= 0),
+            final_unit_price_micros INTEGER NOT NULL CHECK (final_unit_price_micros >= 0),
+            price_source TEXT NOT NULL CHECK (price_source IN ('CUSTOMER','PRICE_LIST','DEFAULT','MANUAL')),
+            price_adjustment_reason TEXT,
+            conversion_num INTEGER NOT NULL CHECK (conversion_num > 0),
+            conversion_den INTEGER NOT NULL CHECK (conversion_den > 0),
+            item_discount_piastres INTEGER NOT NULL DEFAULT 0 CHECK (item_discount_piastres >= 0),
+            invoice_discount_alloc_piastres INTEGER NOT NULL DEFAULT 0 CHECK (invoice_discount_alloc_piastres >= 0),
+            net_piastres INTEGER NOT NULL CHECK (net_piastres >= 0),
+            description_snapshot TEXT NOT NULL,
+            product_code_snapshot TEXT NOT NULL,
+            product_name_snapshot TEXT NOT NULL,
+            unit_name_snapshot TEXT NOT NULL,
+            project_id INTEGER REFERENCES projects(id) ON DELETE RESTRICT,
+            UNIQUE (quotation_id, line_no)
+        );
+        CREATE INDEX ix_quotation_lines_quotation ON quotation_lines(quotation_id);
+        CREATE INDEX ix_quotation_lines_product ON quotation_lines(product_id);
+
+        CREATE TABLE quotation_status_history (
+            id INTEGER PRIMARY KEY,
+            quotation_id INTEGER NOT NULL REFERENCES quotations(id) ON DELETE RESTRICT,
+            from_status TEXT,
+            to_status TEXT NOT NULL,
+            reason TEXT,
+            actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            occurred_at TEXT NOT NULL,
+            metadata_json TEXT
+        );
+        CREATE INDEX ix_quotation_status_history
+            ON quotation_status_history(quotation_id, occurred_at);
+
+        CREATE TABLE document_snapshots (
+            id INTEGER PRIMARY KEY,
+            document_type TEXT NOT NULL CHECK (document_type IN (
+                'QUOTATION','SALES_INVOICE','PURCHASE_DOC','STATEMENT','REPORT'
+            )),
+            document_id INTEGER NOT NULL CHECK (document_id > 0),
+            snapshot_json TEXT NOT NULL CHECK (length(trim(snapshot_json)) > 0),
+            created_at TEXT NOT NULL,
+            UNIQUE (document_type, document_id)
+        );
+
+        ALTER TABLE sales ADD COLUMN source_quotation_id INTEGER
+            REFERENCES quotations(id) ON DELETE RESTRICT;
+        CREATE INDEX ix_sales_source_quotation ON sales(source_quotation_id);
+        CREATE UNIQUE INDEX ux_sales_source_quotation_active
+            ON sales(source_quotation_id)
+            WHERE source_quotation_id IS NOT NULL
+              AND status <> 'CANCELLED';
+
+        CREATE TRIGGER quotations_no_delete
+        BEFORE DELETE ON quotations
+        BEGIN SELECT RAISE(ABORT, 'quotations cannot be deleted'); END;
+
+        CREATE TRIGGER quotation_series_no_delete
+        BEFORE DELETE ON quotation_series
+        BEGIN SELECT RAISE(ABORT, 'quotation series cannot be deleted'); END;
+
+        CREATE TRIGGER quotations_issued_business_fields_immutable
+        BEFORE UPDATE ON quotations
+        WHEN OLD.status <> 'DRAFT' AND (
+            NEW.document_no IS NOT OLD.document_no OR
+            NEW.series_id IS NOT OLD.series_id OR
+            NEW.root_quotation_id IS NOT OLD.root_quotation_id OR
+            NEW.version_no IS NOT OLD.version_no OR
+            NEW.customer_id IS NOT OLD.customer_id OR
+            NEW.project_id IS NOT OLD.project_id OR
+            NEW.price_list_id IS NOT OLD.price_list_id OR
+            NEW.issue_date IS NOT OLD.issue_date OR
+            NEW.valid_until IS NOT OLD.valid_until OR
+            NEW.subtotal_piastres IS NOT OLD.subtotal_piastres OR
+            NEW.item_discount_piastres IS NOT OLD.item_discount_piastres OR
+            NEW.invoice_discount_piastres IS NOT OLD.invoice_discount_piastres OR
+            NEW.total_piastres IS NOT OLD.total_piastres OR
+            NEW.notes IS NOT OLD.notes OR
+            NEW.terms IS NOT OLD.terms OR
+            NEW.official_export_id IS NOT OLD.official_export_id OR
+            NEW.issued_at IS NOT OLD.issued_at OR
+            NEW.created_by IS NOT OLD.created_by OR
+            NEW.created_at IS NOT OLD.created_at
+        )
+        BEGIN SELECT RAISE(ABORT, 'issued quotation business fields are immutable'); END;
+
+        CREATE TRIGGER quotation_issue_requires_root
+        BEFORE UPDATE OF status ON quotations
+        WHEN NEW.status IN ('ISSUED','ACCEPTED','CONVERTED')
+             AND NEW.root_quotation_id IS NULL
+        BEGIN SELECT RAISE(ABORT, 'quotation root is required before issue'); END;
+
+        CREATE TRIGGER quotation_insert_issue_requires_root
+        BEFORE INSERT ON quotations
+        WHEN NEW.status IN ('ISSUED','ACCEPTED','CONVERTED')
+             AND NEW.root_quotation_id IS NULL
+        BEGIN SELECT RAISE(ABORT, 'quotation root is required before issue'); END;
+
+        CREATE TRIGGER quotation_lines_no_edit_after_issue
+        BEFORE UPDATE ON quotation_lines
+        WHEN (SELECT status FROM quotations WHERE id = OLD.quotation_id) <> 'DRAFT'
+        BEGIN SELECT RAISE(ABORT, 'quotation line is immutable after issue'); END;
+
+        CREATE TRIGGER quotation_lines_no_delete_after_issue
+        BEFORE DELETE ON quotation_lines
+        WHEN (SELECT status FROM quotations WHERE id = OLD.quotation_id) <> 'DRAFT'
+        BEGIN SELECT RAISE(ABORT, 'quotation line is immutable after issue'); END;
+
+        CREATE TRIGGER quotation_status_history_no_update
+        BEFORE UPDATE ON quotation_status_history
+        BEGIN SELECT RAISE(ABORT, 'quotation status history is immutable'); END;
+
+        CREATE TRIGGER quotation_status_history_no_delete
+        BEFORE DELETE ON quotation_status_history
+        BEGIN SELECT RAISE(ABORT, 'quotation status history is immutable'); END;
+
+        CREATE TRIGGER document_snapshots_no_update
+        BEFORE UPDATE ON document_snapshots
+        BEGIN SELECT RAISE(ABORT, 'document snapshot is immutable'); END;
+
+        CREATE TRIGGER document_snapshots_no_delete
+        BEFORE DELETE ON document_snapshots
+        BEGIN SELECT RAISE(ABORT, 'document snapshot is immutable'); END;
+
+        CREATE TRIGGER sales_source_quotation_immutable
+        BEFORE UPDATE OF source_quotation_id ON sales
+        WHEN OLD.source_quotation_id IS NOT NEW.source_quotation_id
+        BEGIN SELECT RAISE(ABORT, 'sales source quotation is immutable'); END;
+        """,
+    ),
 ]
 
 

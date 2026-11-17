@@ -4,11 +4,13 @@
 |---|---|
 | الوثيقة | `05_QUOTATIONS_AND_A4_DOCUMENTS.md` |
 | الإصدار | 0.2.0 — Batch 1 |
-| الحالة | **PROPOSED / NEEDS APPROVAL** |
+| الحالة | **PARTIAL — quotation-core decisions approved; A4/PDF engine still NEEDS APPROVAL** |
 | يعتمد عليه | المبيعات، PDF، الطباعة، التدقيق |
 | الطباعة | A4 فقط — CONFIRMED |
 
 > هذه الوثيقة تجمع قواعد عروض الأسعار والمستندات. لا تُنشئ كودًا أو ملفات PDF. أسماء الحالات/الجداول الدقيقة **PROPOSED** حيث لم تُعتمد.
+>
+> **حالة التنفيذ 2026-11-17:** نُفِّذت النواة غير المعتمدة على المُصيّر (دورة الحياة/سجل الحالات، المراجعات/الجذر، التحويل إلى مسودة بيع مع قيد التكرار، الإلغاء/الاستعادة، الترقيم، ولقطات المستند ونموذج التصدير). لم يُختر محرك A4/PDF (ADR-0004)، ولم يُنتج/يُختبر PDF أو A4 أو طابعة حقيقية بعد؛ لذلك المرحلة 7 **غير مكتملة**، ومعايير الخروج المتعلقة بالمُصيّر تبقى مفتوحة.
 
 ## 1. المبدأ: عرض السعر ليس معاملة
 
@@ -25,7 +27,7 @@
 
 ### 2.1 الرأس
 
-- `document_no` فريد (مثال `Q-0012`).
+- `document_no` فريد (وفق `OQ-DOC-001`: `Q-2026-000001`، والمراجعة `Q-2026-000001-R2`).
 - `series_id` / `root_quotation_id` / `version_no`.
 - العميل أو المقاول؛ `customer_id` إلزامي.
 - `project_id` اختياري (حسب `OQ-CON-001`).
@@ -49,7 +51,7 @@
 | `base_qty_micros` | نعم | محسوبة |
 | `original_unit_price_micros` | نعم | قبل التعديل |
 | `final_unit_price_micros` | نعم | السعر المستخدم |
-| `price_source` | نعم | CUSTOMER_SPECIFIC / PRICE_LIST / PRODUCT_DEFAULT / MANUAL |
+| `price_source` | نعم | CUSTOMER_SPECIFIC / PRICE_LIST / PRODUCT_DEFAULT / MANUAL؛ والتنفيذ الحالي يستخدم رموز خدمة البيع `CUSTOMER`/`PRICE_LIST`/`DEFAULT`/`MANUAL` للاتساق |
 | `price_adjustment_reason` | عند التعديل | نص/سبب |
 | `item_discount_piastres` | نعم | 0 مسموح |
 | `invoice_discount_alloc_piastres` | بعد التوزيع | 0 مسموح |
@@ -69,7 +71,7 @@
 `DRAFT`, `ISSUED`, `ACCEPTED`, `REJECTED`, `CANCELLED`, `SUPERSEDED`, `CONVERTED`.
 
 - `EXPIRED` **ليست حالة مخزّنة**؛ تُحسب من `valid_until` والتاريخ المحلي. **CONFIRMED**
-- الحالات المخزّنة الدقيقة **PROPOSED**؛ قد تُعدّل بعد اعتماد `OQ-QUO-005`.
+- الحالات المخزّنة الدقيقة **PROPOSED** في الوثيقة، لكن سياسة الإلغاء حُسمت في `OQ-QUO-005` (2026-11-17): `DRAFT`/`ISSUED` قابلان للإلغاء بصلاحية وسبب، و`ACCEPTED` لا يُلغى.
 
 ### 3.2 مخطط الحالات
 
@@ -81,7 +83,7 @@ stateDiagram-v2
     DRAFT --> CANCELLED: إلغاء
     ISSUED --> ACCEPTED: قبول
     ISSUED --> REJECTED: رفض
-    ISSUED --> CANCELLED: إلغاء (PROPOSED)
+    ISSUED --> CANCELLED: إلغاء (OQ-QUO-005)
     ISSUED --> SUPERSEDED: إصدار مراجعة
     ACCEPTED --> SUPERSEDED: إصدار مراجعة
     ACCEPTED --> CONVERTED: ترحيل فاتورة البيع
@@ -103,10 +105,10 @@ stateDiagram-v2
 | — | DRAFT | `create_quotation` | مستخدم | CONFIRMED |
 | DRAFT | DRAFT | تعديل بيانات مسموحة | منشئ/مصرّح | CONFIRMED |
 | DRAFT | ISSUED | `issue_quotation` + بيانات مكتملة + PDF رسمي ناجح | مستخدم | CONFIRMED (المبدأ) |
-| DRAFT | CANCELLED | `cancel_quotation` + سبب | مستخدم | PROPOSED |
+| DRAFT | CANCELLED | `cancel_quotation` + سبب | مستخدم مصرّح | CONFIRMED (`OQ-QUO-005`, 2026-11-17) |
 | ISSUED | ACCEPTED | `accept_quotation` | مستخدم | CONFIRMED (القدرة) |
 | ISSUED | REJECTED | `reject_quotation` | مستخدم | CONFIRMED (القدرة) |
-| ISSUED | CANCELLED | `cancel_quotation` + سبب | مستخدم | PROPOSED (`OQ-QUO-005`) |
+| ISSUED | CANCELLED | `cancel_quotation` + سبب | مستخدم مصرّح | CONFIRMED (`OQ-QUO-005`, 2026-11-17) |
 | ISSUED/ACCEPTED | SUPERSEDED | إصدار مراجعة | النظام | CONFIRMED |
 | ISSUED/ACCEPTED | CONVERTED | ترحيل فاتورة البيع | النظام | CONFIRMED |
 | أي حالة | EXPIRED | `valid_until` انتهى | محسوب | CONFIRMED |
@@ -120,9 +122,9 @@ stateDiagram-v2
 
 ### 4.1 الترقيم
 
-- `Q-0012` النسخة الأولى.
-- `Q-0012-R2` المراجعة الثانية.
-- `Q-0012-R3` المراجعة الثالثة.
+- `Q-2026-000001` النسخة الأولى (وفق `OQ-DOC-001`).
+- `Q-2026-000001-R2` المراجعة الثانية.
+- `Q-2026-000001-R3` المراجعة الثالثة.
 - كل النسخ تشترك في `root_quotation_id`، و`(series_id, version_no)` فريد.
 
 ### 4.2 `root_quotation_id` — التصميم المقترح
@@ -131,17 +133,17 @@ stateDiagram-v2
 
 1. جدول `quotation_series` (`id`, `base_no`, `created_at`).
 2. عند إنشاء أول عرض:
-   - يُنشأ `quotation_series` بقيمة `Q-0012`.
+   - يُنشأ `quotation_series` بقيمة `Q-2026-000001` من تسلسل `QUOTATION_SERIES`.
    - تُنشأ `quotations` بالنسخة 1 مع `series_id` و`version_no=1`، و`root_quotation_id` مؤقتًا `NULL`.
    - في نفس المعاملة: `root_quotation_id = id` للنسخة الأولى.
 3. المراجعات تشير إلى `root_quotation_id` الخاص بالنسخة الأولى.
 4. قيود:
    - `UNIQUE(series_id, version_no)`.
-   - `root_quotation_id` لا يكون NULL بعد اكتمال الإنشاء.
+   - `root_quotation_id` لا يكون NULL بعد اكتمال الإنشاء، ويُمنع الإصدار/التحويل بدونه.
    - `version_no >= 1`.
    - لا تُحذف السلسلة/الجذر؛ الإلغاء لا يحذف.
 
-> هذا تصميم **PROPOSED**. البديل: `root_quotation_id` يشير إلى `series_id` (وليس إلى صف عرض)؛ مرفوض لأنه يخلط مفاهيم. البديل الآخر: اعتبار `NULL` جذرًا ضمنيًا؛ مرفوض لأنه يضعف القيود.
+> هذا التصميم **PROPOSED** في الوثيقة، ونُفِّذ في المرحلة 7 الجزئية (2026-11-17) مع `quotation_series` و`root_quotation_id`. البديل: `root_quotation_id` يشير إلى `series_id` (وليس إلى صف عرض)؛ مرفوض لأنه يخلط مفاهيم. البديل الآخر: اعتبار `NULL` جذرًا ضمنيًا؛ مرفوض لأنه يضعف القيود.
 
 ### 4.3 إنشاء مراجعة
 
@@ -207,6 +209,7 @@ WHERE source_quotation_id IS NOT NULL
 - إلغاء المسودة يحرّر القيد (تصبح `CANCELLED`).
 - يجب اختبار القيد على مستوى قاعدة البيانات نفسها (SQLite مرشحة)، لا عبر الواجهة فقط.
 - إذا كان `status` نصًا، يجب توحيد القيم؛ لا تُستخدم قيم مختلفة (`cancelled`/`CANCELED`).
+- **التنفيذ (2026-11-17):** القيد موجود في الترحيل 7 (`ux_sales_source_quotation_active`) ومُختبر على مستوى قاعدة البيانات، مع رفض الخدمة للتحويل المكرر قبل الوصول للقيد.
 
 ### 6.4 إلغاء مسودة التحويل
 
@@ -219,7 +222,8 @@ WHERE source_quotation_id IS NOT NULL
 | QUO-CANCEL-005 | تحويل جديد بعد الإلغاء يمر بفحص جديد، ولا يُفترض صحة سابقة. | CONFIRMED |
 | QUO-CANCEL-006 | لا يمكن إلغاء فاتورة بيع `POSTED`؛ تُصحَّح بمرتجع/عكس. | CONFIRMED |
 
-- `status_before_conversion` يُحفظ في `quotation_status_history` أو حقل مخصص؛ التفاصيل **PROPOSED** (`OQ-QUO-001`).
+- `status_before_conversion` يُحفظ في `quotation_status_history` أو حقل مخصص؛ كانت التفاصيل **PROPOSED** (`OQ-QUO-001`) وحُسمت 2026-11-17 بالاعتماد.
+- **القرار (2026-11-17، `OQ-QUO-001`):** تُحفظ الحالة السابقة في `quotation_status_history` عند إنشاء مسودة التحويل. إلغاء المسودة يستعيد الحالة المحفوظة فقط إذا لم يكن العرض منتهيًا؛ العرض المنتهي يبقى منتهيًا، وأي تحويل لاحق يتطلب `override_expired_quotation` وسببًا. لا يغيّر إنشاء مسودة التحويل حالة العرض (يبقى `ISSUED`/`ACCEPTED` حتى ترحيل البيع).
 
 ## 7. التسعير والخصومات داخل العرض
 
@@ -264,12 +268,14 @@ residual = total_discount − Σ floor_i
 1. التحقق من اكتمال العرض والصلاحيات.
 2. عرض A4 إلى ملف مؤقت.
 3. حساب SHA-256.
-4. إنشاء `document_exports` (نوع `QUOTATION_PDF`، مسار، hash، قالب/محرك، مستخدم، وقت).
+4. إنشاء `document_exports` (نوع `QUOTATION`، `export_type='PDF'`، مسار، hash، قالب/محرك، مستخدم، وقت).
 5. نقل الملف إلى مسار نهائي ثابت (Content-addressed أو مجلد مستندات).
 6. تحويل الحالة إلى `ISSUED` + تسجيل الحالة.
 7. إذا فشل أي جزء: لا يُعتبر العرض صادرًا؛ يُنظَّف الملف المؤقت/الجزئي.
 
 > ملف PDF لا يُخزَّن كـBLOB في SQLite. يُحفظ في مجلد مُدار. المعاملة المالية غير معنية هنا؛ لكن اتساق الحالة/الملف مطلوب.
+>
+> **حالة 2026-11-17:** نموذج `document_exports` و`document_snapshots` منفذ، لكن توليد PDF والتحقق من وجود الملف/الـhash واختبار A4/الطابعة **غير منفذة** (ADR-0004). `issue_quotation` يتطلب تصديرًا رسميًا مسجلًا مسبقًا؛ لا يُنشئ PDF ولا يدّعي إصدارًا رسميًا بدونه. اختبارات المرحلة 7 الجزئية تستخدم تصديرًا وهميًا (test double) فقط لاختبار انتقالات الحالة، ولا تُعد دليلًا على PDF.
 
 ### 8.2 بيانات التصدير
 
@@ -302,6 +308,8 @@ residual = total_discount − Σ floor_i
 - الإجماليات والعملة EGP.
 - الشروط/الملاحظات.
 - `template_version`/`renderer_version`.
+
+> **حالة 2026-11-17:** اللقطة الكاملة (متجر/عميل/مشروع/بنود/إجماليات + بيانات التصدير) منفذة في `document_snapshots` وتُلتقط عند الإصدار، وهي غير قابلة للتعديل بعد الإصدار. هوية الشعار/الخط ما زالت مؤجلة (`OQ-DOC-002`): لا يُضمَّن شعار أو خط الآن.
 
 ### 8.4 الشعار والخطوط
 
@@ -388,27 +396,29 @@ residual = total_discount − Σ floor_i
 | AC-QUO-023 | ملف PDF مفقود | لا إعادة إنشاء صامتة؛ خطأ/استعادة | FR-QUO-038 |
 | AC-QUO-024 | ترحيل البيع بعد التحويل | العرض CONVERTED في نفس المعاملة | FR-QUO-037 |
 
+> **تغطية 2026-11-17:** اختبارات headless تغطي أجزاء الحالة/قاعدة البيانات/التحويل من `AC-QUO-004..014` و`AC-QUO-016/017/019/024`. `AC-QUO-015` (القبول الجزئي) يبقى سلوكًا تصميميًا (تحويل كامل فقط + مراجعة) غير مغطى باختبار مخصص. `AC-QUO-001/002/003/018/020/021/022/023` ما زالت مفتوحة لأنها تتطلب PDF/A4/طابعة/شعارًا فعليًا (ADR-0004/OQ-DOC-002). اختبارات الإصدار تستخدم تصديرًا وهميًا (test double)، وليست اختبار PDF.
+
 ## 11. القرارات المفتوحة
 
 | المعرّف | الموضوع |
 |---|---|
-| `OQ-QUO-001` | استعادة الحالة بعد إلغاء مسودة التحويل |
+| `OQ-QUO-001` | استعادة الحالة بعد إلغاء مسودة التحويل — **محسوم 2026-11-17: اعتماد التوصية** |
 | `OQ-QUO-002` | الصلاحية الافتراضية |
 | `OQ-QUO-003` | إثبات القبول |
 | `OQ-QUO-004` | قالب PDF/الشروط |
-| `OQ-QUO-005` | إلغاء عرض ISSUED/ACCEPTED |
+| `OQ-QUO-005` | إلغاء عرض ISSUED/ACCEPTED — **محسوم 2026-11-17: DRAFT/ISSUED قابلان للإلغاء، ACCEPTED لا يُلغى** |
 | `OQ-PRC-002` | انتقال اعتماد السعر/البيع تحت التكلفة |
 | `OQ-PRC-001` | خصم العميل |
-| `OQ-DOC-001` | ترقيم المستندات |
-| `OQ-DOC-002` | الشعار/الخط |
+| `OQ-DOC-001` | ترقيم المستندات — **محسوم 2026-11-17: اعتماد التوصية** |
+| `OQ-DOC-002` | الشعار/الخط — **مفتوح/مؤجل؛ يحجب إصدار المستندات لا نواة العروض** |
 
 ## 12. ما لا تعتمده هذه الوثيقة
 
 - لا تعتمد الحالات/الانتقالات كنهائية.
-- لا تعتمد محرك A4 (ADR-0004).
-- لا تعتمد الخط/الشعار.
+- لا تعتمد محرك A4 (ADR-0004)؛ ما زال **PROPOSED / NEEDS APPROVAL**.
+- لا تعتمد الخط/الشعار (`OQ-DOC-002` مفتوح/مؤجل).
 - لا تعتمد سياسة الخصم/الاعتماد.
-- لا تدّعي إنشاء PDF أو اختبار طباعة.
+- لا تدّعي إنشاء PDF أو اختبار طباعة أو A4؛ أجزاء دورة الحياة/التحويل/اللقطات فقط نُفِّذت واختُبرت headlessly.
 
 ---
 

@@ -294,13 +294,15 @@ WHERE source_quotation_id IS NOT NULL
 
 ### 4.5 العروض
 
+> **حالة 2026-11-17:** جداول `quotation_series`/`quotations`/`quotation_lines`/`quotation_status_history` ونموذج `document_exports`/`document_snapshots` نُفِّذت في الترحيل 7 كجزء من المرحلة 7 الجزئية (النواة غير المعتمدة على المُصيّر). تبقى التفاصيل أدناه مرجعًا تصميميًا؛ محرك A4/PDF لم يُعتمد (ADR-0004).
+
 #### `quotation_series`
 
 `id`, `base_no` UNIQUE, `created_at`.
 
 #### `quotations`
 
-`id`, `document_no` UNIQUE, `series_id`, `root_quotation_id` NULL, `version_no`, `customer_id`, `project_id` NULL, `price_list_id`, `status`, `issue_date`, `valid_until`, `subtotal_piastres`, `item_discount_piastres`, `invoice_discount_piastres`, `total_piastres`, `notes`, `terms`, `official_export_id` NULL, `created_by`, `created_at`, `issued_at`, `converted_at`.
+`id`, `document_no` UNIQUE, `series_id`, `root_quotation_id` NULL, `version_no`, `customer_id`, `project_id` NULL, `price_list_id`, `status`, `issue_date`, `valid_until`, `subtotal_piastres`, `item_discount_piastres`, `invoice_discount_piastres`, `total_piastres`, `notes`, `terms`, `official_export_id` NULL, `cancellation_reason` NULL, `created_by`, `created_at`, `issued_at`, `converted_at`.
 
 - UNIQUE `(series_id, version_no)`.
 - `root_quotation_id` FK self؛ يشير للنسخة الأولى بعد إنشائها.
@@ -379,12 +381,15 @@ ON document_exports(document_type, document_id)
 WHERE is_official = 1;
 ```
 
+> **حالة 2026-11-17:** الجدول والقيد الجزئي منفذان في الترحيل 7. تسجيل التصدير لا يُولّد ملفًا ولا يتحقق من وجوده/الـhash؛ هذه مسؤولية طبقة المُصيّر غير المعتمدة بعد (ADR-0004).
+
 #### `document_snapshots`
 
 `id`, `document_type`, `document_id`, `snapshot_json`, `created_at`.
 
 - snapshot يحتوي كل البيانات المطلوبة تاريخيًا.
 - لا تُعدَّل اللقطة بعد الإصدار.
+- `UNIQUE(document_type, document_id)` في التنفيذ الحالي (الترحيل 7)، مع trigger يمنع التعديل/الحذف.
 
 ## 5. الفهارس المهمة
 
@@ -482,12 +487,12 @@ WHERE is_official = 1;
 
 - `sequences` لكل نوع/سنة: `SALES_INVOICE`, `PURCHASE_INVOICE`, `SALES_RETURN`, `PURCHASE_RETURN`, `QUOTATION_SERIES`, `JOURNAL_ENTRY`, `RECEIPT`, `PAYMENT`, `EXPENSE`, `TRANSFER`.
 - التوليد داخل معاملة الترحيل/الإنشاء.
-- شكل الأرقام **OPEN** (`OQ-DOC-001`).
+- شكل الأرقام محسوم 2026-11-17 (`OQ-DOC-001`): `{TYPE}-{YYYY}-{NNNNNN}` لكل نوع/سنة، والفجوات فقط عند فشل معاملة.
 - لا يُعاد استخدام رقم.
 
 ## 9. جاهزية التنفيذ
 
-**ليست جاهزة.** يعتمد المخطط على:
+**جاهزية جزئية.** نُفِّذت الترحيلات 1–7 للنواة الحالية (بما فيها جداول العروض والمستندات)، لكن المخطط الكامل يبقى مرجعًا، وبعض القرارات ما زالت مفتوحة.
 
 | السؤال | الأثر |
 |---|---|
@@ -505,10 +510,11 @@ WHERE is_official = 1;
 | `OQ-SAL-007` | تسوية المرتجع |
 | `OQ-PRC-001/002` | الأسعار/الخصومات |
 | `OQ-SEC-001` | الصلاحيات |
-| `OQ-DOC-001` | الترقيم |
-| `OQ-QUO-001/005` | حالات/استعادة العرض |
+| `OQ-DOC-001` | الترقيم — **محسوم 2026-11-17** |
+| `OQ-QUO-001/005` | حالات/استعادة العرض — **محسوم 2026-11-17** |
+| `OQ-DOC-002` | الشعار/الخط — **مفتوح/مؤجل** |
 
-- لا تُنشأ migrations قبل اعتماد المخطط والحقول الحرجة.
+- لا تُنشأ migrations قبل اعتماد المخطط والحقول الحرجة. (الترحيلات 1–7 منفذة للنواة الحالية بالفعل.)
 - أي جدول/حقل جديد يجب أن يمر بمراجعة تناسق مع 03/04/05/08.
 
 ## 10. ما لا تعتمده هذه الوثيقة

@@ -46,6 +46,14 @@ PERMISSION_DEFS = {
     "manage_customer_receipts": ("تحصيلات العملاء", "finance"),
     "view_customer_balance": ("رصيد العميل", "sales"),
     "approve_below_cost": ("اعتماد البيع تحت التكلفة", "pricing"),
+    "create_quotation": ("إنشاء مسودة عرض", "quotations"),
+    "issue_quotation": ("إصدار عرض", "quotations"),
+    "create_quotation_revision": ("إنشاء مراجعة عرض", "quotations"),
+    "accept_quotation": ("قبول عرض", "quotations"),
+    "reject_quotation": ("رفض عرض", "quotations"),
+    "cancel_quotation": ("إلغاء عرض", "quotations"),
+    "convert_quotation_to_sale": ("تحويل عرض إلى مسودة بيع", "quotations"),
+    "override_expired_quotation": ("تجاوز انتهاء عرض", "quotations"),
     "view_sensitive_accounting_reports": ("تقارير محاسبية حساسة", "finance"),
     "view_profit_reports": ("تقارير الربح", "reports"),
     "backup_database": ("نسخ احتياطي", "system"),
@@ -56,7 +64,7 @@ ROLE_PERMISSIONS = {
     "OWNER": set(PERMISSION_DEFS),
     "MANAGER": set(PERMISSION_DEFS) - {"manage_users", "manage_roles", "manage_settings", "backup_database", "restore_database"},
     "CASHIER": {"view_dashboard", "create_sales_draft", "post_sales", "apply_item_discount",
-                "view_customer_balance", "manage_customer_receipts"},
+                "view_customer_balance", "manage_customer_receipts", "create_quotation"},
 }
 
 

@@ -6,6 +6,7 @@ from .accounting import AccountingService
 from .auth import PermissionDenied, PermissionService
 from .db import Database
 from .inventory import (
+    available_stock,
     consume_layer,
     create_layer,
     create_movement,
@@ -14,6 +15,8 @@ from .inventory import (
 )
 from .lcp import allocate_largest_remainder, line_total, return_cost
 from .numbering import next_number
+from .pricing import base_quantity, resolve_price, unit_conversion
+from .quotations import mark_quotation_converted, restore_quotation_after_draft_cancel
 
 
 def _now() -> str:
@@ -62,30 +65,16 @@ class SalesService:
 
     @staticmethod
     def _conversion(conn, product, unit_id: int) -> tuple[int, int]:
-        if unit_id == product["base_unit_id"]:
-            return 1, 1
-        row = conn.execute(
-            "SELECT factor_num,factor_den FROM product_unit_conversions "
-            "WHERE product_id=? AND unit_id=?",
-            (product["id"], unit_id),
-        ).fetchone()
-        if row is None:
-            raise SalesError("no conversion for unit")
-        return row["factor_num"], row["factor_den"]
+        try:
+            return unit_conversion(conn, product, unit_id)
+        except ValueError as exc:
+            raise SalesError(str(exc)) from exc
 
     def _base_qty(self, conn, product, unit_id: int, quantity_micros: int) -> tuple[int, int, int]:
-        if quantity_micros <= 0:
-            raise SalesError("quantity must be positive")
-        num, den = self._conversion(conn, product, unit_id)
-        base, remainder = divmod(quantity_micros * num, den)
-        if remainder:
-            raise SalesError("conversion does not produce an integer base quantity")
-        unit = conn.execute(
-            "SELECT allows_fraction FROM units WHERE id=?", (product["base_unit_id"],)
-        ).fetchone()
-        if not unit["allows_fraction"] and base % 1_000_000:
-            raise SalesError("base unit does not allow fractional quantities")
-        return base, num, den
+        try:
+            return base_quantity(conn, product, unit_id, quantity_micros)
+        except ValueError as exc:
+            raise SalesError(str(exc)) from exc
 
     @staticmethod
     def _customer(conn, customer_id: int):
@@ -129,46 +118,11 @@ class SalesService:
 
     def _resolve_price(self, conn, customer_id: int, product_id: int, unit_id: int,
                        price_list_id: int | None) -> tuple[int | None, str | None]:
-        row = conn.execute(
-            "SELECT price_micros FROM customer_prices WHERE customer_id=? AND product_id=? AND unit_id=?",
-            (customer_id, product_id, unit_id),
-        ).fetchone()
-        if row:
-            return int(row["price_micros"]), "CUSTOMER"
-        if price_list_id is not None:
-            row = conn.execute(
-                "SELECT price_micros FROM price_list_items "
-                "WHERE price_list_id=? AND product_id=? AND unit_id=?",
-                (price_list_id, product_id, unit_id),
-            ).fetchone()
-            if row:
-                return int(row["price_micros"]), "PRICE_LIST"
-        row = conn.execute(
-            "SELECT price_micros FROM product_default_prices WHERE product_id=? AND unit_id=?",
-            (product_id, unit_id),
-        ).fetchone()
-        if row:
-            return int(row["price_micros"]), "DEFAULT"
-        return None, None
+        return resolve_price(conn, customer_id, product_id, unit_id, price_list_id)
 
     @staticmethod
     def _stock_available(conn, product) -> int:
-        if product["tracking_mode"] == "LOT":
-            return int(conn.execute(
-                "SELECT COALESCE(SUM(l.remaining_qty_micros),0) FROM inventory_cost_layers l "
-                "JOIN purchase_lots p ON p.id=l.lot_id "
-                "WHERE p.product_id=? AND l.reel_id IS NULL AND l.status='OPEN' "
-                "AND l.remaining_qty_micros>0",
-                (product["id"],),
-            ).fetchone()[0])
-        return int(conn.execute(
-            "SELECT COALESCE(SUM(l.remaining_qty_micros),0) FROM inventory_cost_layers l "
-            "JOIN purchase_lots p ON p.id=l.lot_id "
-            "JOIN reels r ON r.id=l.reel_id "
-            "WHERE p.product_id=? AND l.reel_id IS NOT NULL AND l.status='OPEN' "
-            "AND l.remaining_qty_micros>0 AND r.status NOT IN ('DAMAGED','RETURNED')",
-            (product["id"],),
-        ).fetchone()[0])
+        return available_stock(conn, product)
 
     # ------------------------------------------------------------------
     # Draft invoices
@@ -231,6 +185,11 @@ class SalesService:
             invoice = conn.execute("SELECT * FROM sales WHERE id=?", (invoice_id,)).fetchone()
             if invoice is None or invoice["status"] != "DRAFT":
                 raise SalesError("draft sales invoice not found")
+            if invoice["source_quotation_id"] is not None:
+                raise SalesError(
+                    "commercial fields of a quotation-generated draft are locked; "
+                    "use update_draft_header for payment terms and payment data"
+                )
             customer = self._customer(conn, invoice["customer_id"])
             new_sale_type = sale_type or invoice["sale_type"]
             if new_sale_type != customer["customer_type"]:
@@ -267,6 +226,46 @@ class SalesService:
             )
             self._replace_lines(conn, invoice_id, customer["id"], lines, new_price_list_id,
                                 new_project_id, new_invoice_discount, actor_id)
+
+    def update_draft_header(self, invoice_id: int, *,
+                            payment_type: str | None = None,
+                            due_date=_UNSET,
+                            financial_account_id=_UNSET,
+                            invoice_date: str | None = None,
+                            actor_id: int | None = None) -> None:
+        """Update the non-commercial header fields of a sales draft.
+
+        A quotation-generated draft locks customer/project/lines/prices, but
+        payment terms, payment account, and the invoice date remain editable
+        where the sales rules allow it (BR-QUO-048).
+        """
+        self._require(actor_id, "create_sales_draft")
+        with self.db.transaction() as conn:
+            invoice = conn.execute("SELECT * FROM sales WHERE id=?", (invoice_id,)).fetchone()
+            if invoice is None or invoice["status"] != "DRAFT":
+                raise SalesError("draft sales invoice not found")
+            new_payment_type = payment_type or invoice["payment_type"]
+            if new_payment_type not in {"CASH", "CREDIT"}:
+                raise SalesError("payment type MIXED is deferred under OQ-SAL-003")
+            if financial_account_id is _UNSET:
+                new_financial_account_id = (
+                    invoice["financial_account_id"] if new_payment_type == "CASH" else None
+                )
+            else:
+                new_financial_account_id = financial_account_id
+            if new_payment_type == "CASH":
+                if new_financial_account_id is None:
+                    raise SalesError("cash sale requires a financial account")
+                self._financial_account(conn, new_financial_account_id)
+            new_due_date = invoice["due_date"] if due_date is _UNSET else due_date
+            new_invoice_date = invoice_date or invoice["invoice_date"]
+            conn.execute(
+                "UPDATE sales SET payment_type=?,financial_account_id=?,due_date=?,invoice_date=? "
+                "WHERE id=?",
+                (new_payment_type, new_financial_account_id, new_due_date,
+                 new_invoice_date, invoice_id),
+            )
+            self._audit(conn, "SALES_DRAFT_HEADER_UPDATED", "sales", invoice_id, actor_id)
 
     def _replace_lines(self, conn, invoice_id: int, customer_id: int, lines: list[dict],
                        price_list_id: int | None, project_id: int | None,
@@ -381,6 +380,10 @@ class SalesService:
                 "VALUES(?,?,?,?,?,?)",
                 (invoice_id, "DRAFT", "CANCELLED", reason.strip(), actor_id, _now()),
             )
+            if invoice["source_quotation_id"] is not None:
+                restore_quotation_after_draft_cancel(
+                    conn, invoice["source_quotation_id"], invoice_id, actor_id, reason.strip(),
+                )
             self._audit(conn, "SALES_DRAFT_CANCELLED", "sales", invoice_id, actor_id, reason.strip())
 
     # ------------------------------------------------------------------
@@ -467,6 +470,10 @@ class SalesService:
                 "VALUES(?,?,?,?,?,?)",
                 (invoice_id, "DRAFT", "POSTED", reason, actor_id, _now()),
             )
+            if invoice["source_quotation_id"] is not None:
+                mark_quotation_converted(
+                    conn, invoice["source_quotation_id"], invoice_id, actor_id,
+                )
             return {
                 "invoice_id": invoice_id,
                 "journal_id": journal_id,

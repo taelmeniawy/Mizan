@@ -37,7 +37,11 @@ PERMISSION_DEFS = {
     "view_inventory_cost": ("رؤية قيمة المخزون", "inventory"),
     "post_sales": ("ترحيل المبيعات", "sales"),
     "create_sales_draft": ("إنشاء مسودة بيع", "sales"),
+    "cancel_sales_draft": ("إلغاء مسودة بيع", "sales"),
     "post_sales_return": ("ترحيل مرتجع البيع", "sales"),
+    "apply_item_discount": ("خصم بند", "sales"),
+    "apply_invoice_discount": ("خصم فاتورة", "sales"),
+    "edit_sale_price": ("تعديل سعر البيع", "sales"),
     "issue_customer_refund": ("رد نقدي/بنكي لعميل", "sales"),
     "manage_customer_receipts": ("تحصيلات العملاء", "finance"),
     "view_customer_balance": ("رصيد العميل", "sales"),
@@ -51,7 +55,8 @@ PERMISSION_DEFS = {
 ROLE_PERMISSIONS = {
     "OWNER": set(PERMISSION_DEFS),
     "MANAGER": set(PERMISSION_DEFS) - {"manage_users", "manage_roles", "manage_settings", "backup_database", "restore_database"},
-    "CASHIER": {"view_dashboard", "create_sales_draft", "post_sales", "view_customer_balance", "manage_customer_receipts"},
+    "CASHIER": {"view_dashboard", "create_sales_draft", "post_sales", "apply_item_discount",
+                "view_customer_balance", "manage_customer_receipts"},
 }
 
 

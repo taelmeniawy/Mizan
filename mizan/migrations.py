@@ -473,6 +473,361 @@ MIGRATIONS: list[Migration] = [
         BEGIN SELECT RAISE(ABORT, 'posted purchase invoice is immutable'); END;
         """,
     ),
+    Migration(
+        5,
+        "sales",
+        """
+        CREATE TABLE sales (
+            id INTEGER PRIMARY KEY,
+            document_no TEXT NOT NULL UNIQUE,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+            project_id INTEGER REFERENCES projects(id) ON DELETE RESTRICT,
+            price_list_id INTEGER REFERENCES price_lists(id) ON DELETE RESTRICT,
+            sale_type TEXT NOT NULL CHECK (sale_type IN ('RETAIL','WHOLESALE','CONTRACTOR')),
+            payment_type TEXT NOT NULL CHECK (payment_type IN ('CASH','CREDIT','MIXED')),
+            status TEXT NOT NULL DEFAULT 'DRAFT' CHECK (status IN ('DRAFT','POSTED','CANCELLED')),
+            invoice_date TEXT NOT NULL,
+            due_date TEXT,
+            financial_account_id INTEGER REFERENCES financial_accounts(id) ON DELETE RESTRICT,
+            subtotal_piastres INTEGER NOT NULL DEFAULT 0 CHECK (subtotal_piastres >= 0),
+            item_discount_piastres INTEGER NOT NULL DEFAULT 0 CHECK (item_discount_piastres >= 0),
+            invoice_discount_piastres INTEGER NOT NULL DEFAULT 0 CHECK (invoice_discount_piastres >= 0),
+            total_piastres INTEGER NOT NULL DEFAULT 0 CHECK (total_piastres >= 0),
+            below_cost_reason TEXT,
+            below_cost_approved_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            posted_at TEXT,
+            journal_entry_id INTEGER UNIQUE REFERENCES journal_entries(id) ON DELETE RESTRICT,
+            reversal_journal_entry_id INTEGER UNIQUE REFERENCES journal_entries(id) ON DELETE RESTRICT,
+            reversal_reason TEXT,
+            reversed_at TEXT,
+            reversed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            cancellation_reason TEXT,
+            created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK (total_piastres = subtotal_piastres - item_discount_piastres - invoice_discount_piastres),
+            CHECK (item_discount_piastres <= subtotal_piastres),
+            CHECK (invoice_discount_piastres <= subtotal_piastres - item_discount_piastres)
+        );
+        CREATE INDEX ix_sales_customer_date ON sales(customer_id, invoice_date);
+        CREATE INDEX ix_sales_status ON sales(status);
+
+        CREATE TABLE sales_lines (
+            id INTEGER PRIMARY KEY,
+            sales_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE RESTRICT,
+            line_no INTEGER NOT NULL,
+            product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+            unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE RESTRICT,
+            quantity_micros INTEGER NOT NULL CHECK (quantity_micros > 0),
+            base_qty_micros INTEGER NOT NULL CHECK (base_qty_micros > 0),
+            unit_price_micros INTEGER NOT NULL CHECK (unit_price_micros >= 0),
+            gross_piastres INTEGER NOT NULL CHECK (gross_piastres >= 0),
+            item_discount_piastres INTEGER NOT NULL DEFAULT 0 CHECK (item_discount_piastres >= 0),
+            invoice_discount_alloc_piastres INTEGER NOT NULL DEFAULT 0 CHECK (invoice_discount_alloc_piastres >= 0),
+            net_piastres INTEGER NOT NULL CHECK (net_piastres >= 0),
+            cost_piastres INTEGER NOT NULL DEFAULT 0 CHECK (cost_piastres >= 0),
+            price_source TEXT NOT NULL CHECK (price_source IN ('CUSTOMER','PRICE_LIST','DEFAULT','MANUAL')),
+            price_adjustment_reason TEXT,
+            conversion_num INTEGER NOT NULL CHECK (conversion_num > 0),
+            conversion_den INTEGER NOT NULL CHECK (conversion_den > 0),
+            tracking_mode TEXT NOT NULL CHECK (tracking_mode IN ('LOT','REEL')),
+            project_id INTEGER REFERENCES projects(id) ON DELETE RESTRICT,
+            quotation_line_id INTEGER,
+            UNIQUE (sales_id, line_no),
+            CHECK (item_discount_piastres <= gross_piastres),
+            CHECK (invoice_discount_alloc_piastres <= gross_piastres - item_discount_piastres),
+            CHECK (net_piastres = gross_piastres - item_discount_piastres - invoice_discount_alloc_piastres)
+        );
+        CREATE INDEX ix_sales_lines_sales ON sales_lines(sales_id);
+        CREATE INDEX ix_sales_lines_product ON sales_lines(product_id);
+        CREATE INDEX ix_lot_alloc_sales_line ON lot_allocations(sales_line_id);
+        CREATE INDEX ix_reel_alloc_sales_line ON reel_allocations(sales_line_id);
+
+        CREATE TABLE sales_status_history (
+            id INTEGER PRIMARY KEY,
+            sales_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE RESTRICT,
+            from_status TEXT,
+            to_status TEXT NOT NULL,
+            reason TEXT,
+            actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            occurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX ix_sales_status_history ON sales_status_history(sales_id, occurred_at);
+
+        CREATE TABLE sales_returns (
+            id INTEGER PRIMARY KEY,
+            document_no TEXT NOT NULL UNIQUE,
+            sales_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE RESTRICT,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+            return_date TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'DRAFT' CHECK (status IN ('DRAFT','POSTED','CANCELLED')),
+            settlement_method TEXT NOT NULL DEFAULT 'REDUCE_RECEIVABLE'
+                CHECK (settlement_method IN ('REDUCE_RECEIVABLE','CUSTOMER_CREDIT','CASH_REFUND','BANK_REFUND','MIXED')),
+            commercial_total_piastres INTEGER NOT NULL DEFAULT 0 CHECK (commercial_total_piastres >= 0),
+            inventory_cost_piastres INTEGER NOT NULL DEFAULT 0 CHECK (inventory_cost_piastres >= 0),
+            ar_reduction_piastres INTEGER NOT NULL DEFAULT 0 CHECK (ar_reduction_piastres >= 0),
+            customer_credit_piastres INTEGER NOT NULL DEFAULT 0 CHECK (customer_credit_piastres >= 0),
+            refund_piastres INTEGER NOT NULL DEFAULT 0 CHECK (refund_piastres >= 0),
+            financial_account_id INTEGER REFERENCES financial_accounts(id) ON DELETE RESTRICT,
+            refund_reference TEXT,
+            damaged_cost_accounting TEXT NOT NULL DEFAULT 'NOT_APPLICABLE'
+                CHECK (damaged_cost_accounting IN (
+                    'NOT_APPLICABLE','PENDING','DEFERRED_OQ_INV_004','POSTED_5020_5010'
+                )),
+            reason TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+            journal_entry_id INTEGER UNIQUE REFERENCES journal_entries(id) ON DELETE RESTRICT,
+            posted_at TEXT,
+            created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK (status <> 'POSTED'
+                   OR commercial_total_piastres = ar_reduction_piastres + customer_credit_piastres + refund_piastres),
+            CHECK (refund_piastres = 0 OR financial_account_id IS NOT NULL),
+            CHECK (refund_piastres = 0 OR (refund_reference IS NOT NULL AND length(trim(refund_reference)) > 0))
+        );
+        CREATE INDEX ix_sales_returns_sales ON sales_returns(sales_id);
+
+        CREATE TABLE sales_return_lines (
+            id INTEGER PRIMARY KEY,
+            sales_return_id INTEGER NOT NULL REFERENCES sales_returns(id) ON DELETE RESTRICT,
+            line_no INTEGER NOT NULL,
+            sales_line_id INTEGER NOT NULL REFERENCES sales_lines(id) ON DELETE RESTRICT,
+            quantity_micros INTEGER NOT NULL CHECK (quantity_micros > 0),
+            base_qty_micros INTEGER NOT NULL CHECK (base_qty_micros > 0),
+            commercial_value_piastres INTEGER NOT NULL DEFAULT 0 CHECK (commercial_value_piastres >= 0),
+            cost_piastres INTEGER NOT NULL DEFAULT 0 CHECK (cost_piastres >= 0),
+            condition TEXT NOT NULL CHECK (condition IN ('SELLABLE','DAMAGED')),
+            lot_id INTEGER REFERENCES purchase_lots(id) ON DELETE RESTRICT,
+            reel_id INTEGER REFERENCES reels(id) ON DELETE RESTRICT,
+            UNIQUE (sales_return_id, line_no)
+        );
+        CREATE INDEX ix_sales_return_lines_return ON sales_return_lines(sales_return_id);
+        CREATE INDEX ix_sales_return_lines_sale_line ON sales_return_lines(sales_line_id);
+
+        CREATE TABLE sales_return_line_allocations (
+            id INTEGER PRIMARY KEY,
+            sales_return_line_id INTEGER NOT NULL REFERENCES sales_return_lines(id) ON DELETE RESTRICT,
+            allocation_kind TEXT NOT NULL CHECK (allocation_kind IN ('LOT','REEL')),
+            original_allocation_id INTEGER NOT NULL,
+            quantity_micros INTEGER NOT NULL CHECK (quantity_micros > 0),
+            UNIQUE (sales_return_line_id, allocation_kind, original_allocation_id)
+        );
+        CREATE INDEX ix_srla_line ON sales_return_line_allocations(sales_return_line_id);
+        CREATE INDEX ix_srla_original ON sales_return_line_allocations(allocation_kind, original_allocation_id);
+
+        CREATE TABLE customer_receipts (
+            id INTEGER PRIMARY KEY,
+            document_no TEXT NOT NULL UNIQUE,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+            financial_account_id INTEGER NOT NULL REFERENCES financial_accounts(id) ON DELETE RESTRICT,
+            amount_piastres INTEGER NOT NULL CHECK (amount_piastres > 0),
+            receipt_date TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'DRAFT' CHECK (status IN ('DRAFT','POSTED','CANCELLED')),
+            notes TEXT,
+            journal_entry_id INTEGER UNIQUE REFERENCES journal_entries(id) ON DELETE RESTRICT,
+            posted_at TEXT,
+            created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE customer_receipt_allocations (
+            id INTEGER PRIMARY KEY,
+            receipt_id INTEGER NOT NULL REFERENCES customer_receipts(id) ON DELETE RESTRICT,
+            sales_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE RESTRICT,
+            amount_piastres INTEGER NOT NULL CHECK (amount_piastres > 0),
+            UNIQUE (receipt_id, sales_id)
+        );
+        CREATE INDEX ix_receipt_alloc_sales ON customer_receipt_allocations(sales_id);
+
+        CREATE TABLE customer_credits (
+            id INTEGER PRIMARY KEY,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+            source_type TEXT NOT NULL CHECK (source_type IN ('SALES_RETURN','OVERPAYMENT','MANUAL_APPROVED')),
+            source_id INTEGER NOT NULL,
+            amount_piastres INTEGER NOT NULL CHECK (amount_piastres > 0),
+            remaining_piastres INTEGER NOT NULL
+                CHECK (remaining_piastres >= 0 AND remaining_piastres <= amount_piastres),
+            status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN','APPLIED','CLOSED')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (source_type, source_id)
+        );
+        CREATE INDEX ix_customer_credits_customer ON customer_credits(customer_id, status);
+
+        CREATE TABLE customer_credit_applications (
+            id INTEGER PRIMARY KEY,
+            credit_id INTEGER NOT NULL REFERENCES customer_credits(id) ON DELETE RESTRICT,
+            sales_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE RESTRICT,
+            amount_piastres INTEGER NOT NULL CHECK (amount_piastres > 0),
+            applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX ix_credit_app_sales ON customer_credit_applications(sales_id);
+
+        CREATE TRIGGER customer_return_layer_parent_required
+        BEFORE INSERT ON inventory_cost_layers
+        WHEN NEW.layer_type = 'CUSTOMER_RETURN' AND NEW.parent_issue_allocation_id IS NULL
+        BEGIN SELECT RAISE(ABORT, 'customer return layer requires a parent issue allocation'); END;
+
+        CREATE TRIGGER base_layer_no_parent
+        BEFORE INSERT ON inventory_cost_layers
+        WHEN NEW.layer_type IN ('BASE','ADJUSTMENT_IN') AND NEW.parent_issue_allocation_id IS NOT NULL
+        BEGIN SELECT RAISE(ABORT, 'base/adjustment layer cannot have a parent allocation'); END;
+
+        CREATE TRIGGER sales_posted_immutable
+        BEFORE UPDATE ON sales
+        WHEN OLD.status = 'POSTED' AND (
+            NEW.document_no IS NOT OLD.document_no OR
+            NEW.customer_id IS NOT OLD.customer_id OR
+            NEW.project_id IS NOT OLD.project_id OR
+            NEW.price_list_id IS NOT OLD.price_list_id OR
+            NEW.sale_type IS NOT OLD.sale_type OR
+            NEW.payment_type IS NOT OLD.payment_type OR
+            NEW.invoice_date IS NOT OLD.invoice_date OR
+            NEW.due_date IS NOT OLD.due_date OR
+            NEW.financial_account_id IS NOT OLD.financial_account_id OR
+            NEW.subtotal_piastres IS NOT OLD.subtotal_piastres OR
+            NEW.item_discount_piastres IS NOT OLD.item_discount_piastres OR
+            NEW.invoice_discount_piastres IS NOT OLD.invoice_discount_piastres OR
+            NEW.total_piastres IS NOT OLD.total_piastres OR
+            NEW.below_cost_reason IS NOT OLD.below_cost_reason OR
+            NEW.below_cost_approved_by IS NOT OLD.below_cost_approved_by OR
+            NEW.cancellation_reason IS NOT OLD.cancellation_reason OR
+            NEW.posted_at IS NOT OLD.posted_at OR
+            NEW.journal_entry_id IS NOT OLD.journal_entry_id OR
+            NEW.created_by IS NOT OLD.created_by OR
+            NEW.created_at IS NOT OLD.created_at
+        )
+        BEGIN SELECT RAISE(ABORT, 'posted sales invoice is immutable'); END;
+
+        CREATE TRIGGER sales_posted_no_cancel
+        BEFORE UPDATE ON sales
+        WHEN OLD.status = 'POSTED' AND NEW.status = 'CANCELLED'
+        BEGIN SELECT RAISE(ABORT, 'posted sales invoice cannot be cancelled'); END;
+
+        CREATE TRIGGER sales_posted_no_reopen
+        BEFORE UPDATE ON sales
+        WHEN OLD.status = 'POSTED' AND NEW.status = 'DRAFT'
+        BEGIN SELECT RAISE(ABORT, 'posted sales invoice cannot be reopened'); END;
+
+        CREATE TRIGGER sales_no_delete_posted
+        BEFORE DELETE ON sales
+        WHEN OLD.status = 'POSTED'
+        BEGIN SELECT RAISE(ABORT, 'posted sales invoice is immutable'); END;
+
+        CREATE TRIGGER sales_reversal_immutable
+        BEFORE UPDATE ON sales
+        WHEN OLD.reversal_journal_entry_id IS NOT NULL AND (
+            NEW.reversal_journal_entry_id IS NOT OLD.reversal_journal_entry_id OR
+            NEW.reversal_reason IS NOT OLD.reversal_reason OR
+            NEW.reversed_at IS NOT OLD.reversed_at OR
+            NEW.reversed_by IS NOT OLD.reversed_by
+        )
+        BEGIN SELECT RAISE(ABORT, 'sales reversal is immutable'); END;
+
+        CREATE TRIGGER sales_lines_no_edit_posted
+        BEFORE UPDATE ON sales_lines
+        WHEN (SELECT status FROM sales WHERE id = OLD.sales_id) = 'POSTED'
+        BEGIN SELECT RAISE(ABORT, 'posted sales line is immutable'); END;
+
+        CREATE TRIGGER sales_lines_no_delete_posted
+        BEFORE DELETE ON sales_lines
+        WHEN (SELECT status FROM sales WHERE id = OLD.sales_id) = 'POSTED'
+        BEGIN SELECT RAISE(ABORT, 'posted sales line is immutable'); END;
+
+        CREATE TRIGGER sales_returns_no_edit_posted
+        BEFORE UPDATE ON sales_returns
+        WHEN OLD.status = 'POSTED' AND (
+            NEW.document_no IS NOT OLD.document_no OR
+            NEW.sales_id IS NOT OLD.sales_id OR
+            NEW.customer_id IS NOT OLD.customer_id OR
+            NEW.return_date IS NOT OLD.return_date OR
+            NEW.settlement_method IS NOT OLD.settlement_method OR
+            NEW.commercial_total_piastres IS NOT OLD.commercial_total_piastres OR
+            NEW.inventory_cost_piastres IS NOT OLD.inventory_cost_piastres OR
+            NEW.ar_reduction_piastres IS NOT OLD.ar_reduction_piastres OR
+            NEW.customer_credit_piastres IS NOT OLD.customer_credit_piastres OR
+            NEW.refund_piastres IS NOT OLD.refund_piastres OR
+            NEW.financial_account_id IS NOT OLD.financial_account_id OR
+            NEW.refund_reference IS NOT OLD.refund_reference OR
+            NEW.damaged_cost_accounting IS NOT OLD.damaged_cost_accounting OR
+            NEW.reason IS NOT OLD.reason OR
+            NEW.journal_entry_id IS NOT OLD.journal_entry_id OR
+            NEW.posted_at IS NOT OLD.posted_at OR
+            NEW.created_by IS NOT OLD.created_by OR
+            NEW.created_at IS NOT OLD.created_at
+        )
+        BEGIN SELECT RAISE(ABORT, 'posted sales return is immutable'); END;
+
+        CREATE TRIGGER sales_returns_posted_no_cancel
+        BEFORE UPDATE ON sales_returns
+        WHEN OLD.status = 'POSTED' AND NEW.status = 'CANCELLED'
+        BEGIN SELECT RAISE(ABORT, 'posted sales return cannot be cancelled'); END;
+
+        CREATE TRIGGER sales_returns_no_delete_posted
+        BEFORE DELETE ON sales_returns
+        WHEN OLD.status = 'POSTED'
+        BEGIN SELECT RAISE(ABORT, 'posted sales return is immutable'); END;
+
+        CREATE TRIGGER sales_return_lines_no_edit_posted
+        BEFORE UPDATE ON sales_return_lines
+        WHEN (SELECT status FROM sales_returns WHERE id = OLD.sales_return_id) = 'POSTED'
+        BEGIN SELECT RAISE(ABORT, 'posted sales return line is immutable'); END;
+
+        CREATE TRIGGER sales_return_lines_no_delete_posted
+        BEFORE DELETE ON sales_return_lines
+        WHEN (SELECT status FROM sales_returns WHERE id = OLD.sales_return_id) = 'POSTED'
+        BEGIN SELECT RAISE(ABORT, 'posted sales return line is immutable'); END;
+
+        CREATE TRIGGER sales_return_line_allocations_no_edit
+        BEFORE UPDATE ON sales_return_line_allocations
+        WHEN (SELECT sr.status FROM sales_returns sr
+              JOIN sales_return_lines srl ON srl.sales_return_id = sr.id
+              WHERE srl.id = OLD.sales_return_line_id) = 'POSTED'
+        BEGIN SELECT RAISE(ABORT, 'posted sales return allocation is immutable'); END;
+
+        CREATE TRIGGER sales_return_line_allocations_no_delete
+        BEFORE DELETE ON sales_return_line_allocations
+        WHEN (SELECT sr.status FROM sales_returns sr
+              JOIN sales_return_lines srl ON srl.sales_return_id = sr.id
+              WHERE srl.id = OLD.sales_return_line_id) = 'POSTED'
+        BEGIN SELECT RAISE(ABORT, 'posted sales return allocation is immutable'); END;
+
+        CREATE TRIGGER customer_receipts_no_edit_posted
+        BEFORE UPDATE ON customer_receipts
+        WHEN OLD.status = 'POSTED' AND (
+            NEW.document_no IS NOT OLD.document_no OR
+            NEW.customer_id IS NOT OLD.customer_id OR
+            NEW.financial_account_id IS NOT OLD.financial_account_id OR
+            NEW.amount_piastres IS NOT OLD.amount_piastres OR
+            NEW.receipt_date IS NOT OLD.receipt_date OR
+            NEW.journal_entry_id IS NOT OLD.journal_entry_id OR
+            NEW.posted_at IS NOT OLD.posted_at
+        )
+        BEGIN SELECT RAISE(ABORT, 'posted customer receipt is immutable'); END;
+
+        CREATE TRIGGER customer_receipts_no_delete_posted
+        BEFORE DELETE ON customer_receipts
+        WHEN OLD.status = 'POSTED'
+        BEGIN SELECT RAISE(ABORT, 'posted customer receipt is immutable'); END;
+
+        CREATE TRIGGER customer_receipt_allocations_no_edit
+        BEFORE UPDATE ON customer_receipt_allocations
+        WHEN (SELECT status FROM customer_receipts WHERE id = OLD.receipt_id) = 'POSTED'
+        BEGIN SELECT RAISE(ABORT, 'posted customer receipt allocation is immutable'); END;
+
+        CREATE TRIGGER customer_receipt_allocations_no_delete
+        BEFORE DELETE ON customer_receipt_allocations
+        WHEN (SELECT status FROM customer_receipts WHERE id = OLD.receipt_id) = 'POSTED'
+        BEGIN SELECT RAISE(ABORT, 'posted customer receipt allocation is immutable'); END;
+        """,
+    ),
+    Migration(
+        6,
+        "returned_reel_identity",
+        """
+        ALTER TABLE reels ADD COLUMN source_reel_id INTEGER REFERENCES reels(id) ON DELETE RESTRICT;
+        ALTER TABLE reels ADD COLUMN source_issue_allocation_id INTEGER REFERENCES reel_allocations(id) ON DELETE RESTRICT;
+        CREATE INDEX ix_reels_source_reel ON reels(source_reel_id);
+        CREATE INDEX ix_reels_source_issue_alloc ON reels(source_issue_allocation_id);
+        """,
+    ),
 ]
 
 

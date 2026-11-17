@@ -39,6 +39,14 @@ def test_T_SEC_003_cashier_can_post_sale(auth):
     PermissionService(auth.db).require(cashier, "post_sales")
 
 
+def test_T_SEC_004_manager_cannot_manage_users(auth):
+    manager = auth.create_user("manager", "Manager", "manager-pass", ["MANAGER"])
+    permissions = PermissionService(auth.db)
+    assert not permissions.has(manager, "manage_users")
+    with pytest.raises(PermissionDenied):
+        permissions.require(manager, "manage_users")
+
+
 def test_T_SEC_005_disabled_user_cannot_login(auth):
     user = auth.create_user("cashier", "Cashier", "cashier-pass", ["CASHIER"])
     auth.disable_user(user, actor_id=user)

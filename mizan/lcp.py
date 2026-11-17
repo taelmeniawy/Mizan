@@ -8,6 +8,13 @@ def round_half_up(num: int, den: int) -> int:
     return (2 * num + den) // (2 * den)
 
 
+def line_total(price_micros: int, quantity_micros: int) -> int:
+    """Round price (micro-EGP/unit) x quantity (micro-units) to piastres, half up."""
+    if price_micros < 0 or quantity_micros <= 0:
+        raise ValueError("invalid price or quantity")
+    return (2 * price_micros * quantity_micros + 10_000_000_000) // 20_000_000_000
+
+
 def t_layer(original_qty: int, original_cost: int, position: int) -> int:
     if original_qty <= 0 or original_cost < 0 or position < 0 or position > original_qty:
         raise ValueError("invalid layer position")

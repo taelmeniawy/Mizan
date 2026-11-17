@@ -1,6 +1,6 @@
 # Decisions Approved for Implementation
 
-**Owner approval:** 2026-11-16. Documentation remains the spec; this file records implementation decisions only.
+**Owner approval:** 2026-11-16; OQ-INV-012 and OQ-INV-004 approved 2026-11-17. Documentation remains the spec; this file records implementation decisions only.
 
 | ID | Decision | Source |
 |---|---|---|
@@ -16,6 +16,8 @@
 | OQ-PRC-002 | Below-cost sale forbidden unless `approve_below_cost` + reason. | OQ recommendation |
 | OQ-SAL-007 | Sales return settles AR first, then customer credit; cash refund requires permission. | OQ recommendation |
 | OQ-SEC-001 | Owner/Manager/Cashier matrix from docs/08. | OQ recommendation |
+| OQ-INV-012 | Every returned reel length creates a new returned reel/layer, explicitly linked to the original reel and original sale allocation; it is never merged into or added to the original reel's remaining quantity. Over-return and duplicate-return protections remain. | Owner approval 2026-11-17 |
+| OQ-INV-004 | Damaged sales returns keep `SALE_RETURN_IN` then `DAMAGE` in one transaction and post the captured damaged cost as direct loss: debit `5020`, credit `5010`. No `1210` damaged-inventory account or disposal workflow; commercial settlement behavior is unchanged. | Owner approval 2026-11-17 |
 | Other OQs | Adopt the "التوصية" in `docs/10_OPEN_QUESTIONS.md`; unresolved implementation details follow the cited ADR. | Owner instruction |
 
-Implementation status: phases 1–5 in progress. LCP is approved for implementation by the owner instruction above, but remains documented as a proposal until the docs are formally updated.
+Implementation status: phases 1–6 implemented; Phase 6 acceptance is covered by the recorded test suite. LCP is approved for implementation by the owner instruction above, but remains documented as a proposal until the docs are formally updated.

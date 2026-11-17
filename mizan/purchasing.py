@@ -5,16 +5,19 @@ from datetime import datetime, timezone
 from .accounting import AccountingService
 from .auth import PermissionService
 from .db import Database
-from .lcp import allocate_largest_remainder, outflow_cost, remaining_cost
+from .inventory import (
+    InventoryError,
+    consume_lot_layers,
+    create_layer,
+    create_movement,
+    refresh_lot_status,
+)
+from .lcp import allocate_largest_remainder, line_total
 from .numbering import next_number
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-class InventoryError(ValueError):
-    pass
 
 
 class PurchasingService:
@@ -53,9 +56,7 @@ class PurchasingService:
 
     @staticmethod
     def _line_total(price_micros: int, quantity_micros: int) -> int:
-        if price_micros < 0 or quantity_micros <= 0:
-            raise ValueError("invalid price or quantity")
-        return (2 * price_micros * quantity_micros + 10_000_000_000) // 20_000_000_000
+        return line_total(price_micros, quantity_micros)
 
     def create_invoice(self, supplier_id: int, invoice_date: str, lines: list[dict], expense_piastres: int = 0,
                        payment_type: str = "CREDIT", supplier_invoice_no: str | None = None,
@@ -106,26 +107,15 @@ class PurchasingService:
 
     def _create_layer(self, conn, lot_id: int, reel_id: int | None, layer_type: str, qty: int,
                       cost: int, received_at: str, suborder: int = 0) -> int:
-        cur = conn.execute(
-            "INSERT INTO inventory_cost_layers(lot_id,reel_id,layer_type,original_qty_micros,original_cost_piastres,"
-            "position_micros,remaining_qty_micros,remaining_cost_piastres,fifo_anchor_at,fifo_suborder) "
-            "VALUES(?,?,?,?,?,0,?,?,?,?)",
-            (lot_id, reel_id, layer_type, qty, cost, qty, cost, received_at, suborder),
-        )
-        return int(cur.lastrowid)
+        return create_layer(conn, lot_id, reel_id, layer_type, qty, cost, received_at, suborder)
 
     def _create_movement(self, conn, movement_type: str, product_id: int, lot_id: int, reel_id: int | None,
                          quantity: int, cost: int, direction: str, source_type: str, source_id: int,
                          occurred_at: str, actor_id: int | None, source_line_id: int | None = None) -> int:
-        movement_no = next_number(conn, "STOCK_MOVEMENT", int(occurred_at[:4]), "SM-")
-        cur = conn.execute(
-            "INSERT INTO stock_movements(movement_no,movement_type,product_id,lot_id,reel_id,quantity_micros,cost_piastres,"
-            "direction,source_type,source_id,source_line_id,occurred_at,posted_at,created_by) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (movement_no, movement_type, product_id, lot_id, reel_id, quantity, cost, direction,
-             source_type, source_id, source_line_id, occurred_at, _now(), actor_id),
+        return create_movement(
+            conn, movement_type, product_id, lot_id, reel_id, quantity, cost, direction,
+            source_type, source_id, occurred_at, actor_id, source_line_id,
         )
-        return int(cur.lastrowid)
 
     def post_invoice(self, invoice_id: int, actor_id: int | None = None) -> dict:
         if actor_id is not None:
@@ -223,42 +213,10 @@ class PurchasingService:
             return {"invoice_id": invoice_id, "journal_id": journal_id, "total": total}
 
     def _refresh_lot_status(self, conn, lot_id: int) -> None:
-        remaining = conn.execute(
-            "SELECT COALESCE(SUM(remaining_qty_micros),0) FROM inventory_cost_layers WHERE lot_id=?",
-            (lot_id,),
-        ).fetchone()[0]
-        conn.execute("UPDATE purchase_lots SET status=? WHERE id=?", ("EXHAUSTED" if remaining == 0 else "OPEN", lot_id))
+        refresh_lot_status(conn, lot_id)
 
     def _consume(self, conn, lot_id: int, quantity: int, reel_id: int | None = None) -> list[dict]:
-        if quantity <= 0:
-            raise ValueError("quantity must be positive")
-        layers = conn.execute(
-            "SELECT * FROM inventory_cost_layers WHERE lot_id=? AND (? IS NULL OR reel_id=?) AND remaining_qty_micros > 0 AND status='OPEN' "
-            "ORDER BY fifo_anchor_at, fifo_suborder, id",
-            (lot_id, reel_id, reel_id),
-        ).fetchall()
-        available = sum(layer["remaining_qty_micros"] for layer in layers)
-        if available < quantity:
-            raise InventoryError(f"insufficient stock: requested {quantity}, available {available}")
-        result = []
-        left = quantity
-        for layer in layers:
-            if left <= 0:
-                break
-            take = min(left, layer["remaining_qty_micros"])
-            cost = outflow_cost(layer["original_qty_micros"], layer["original_cost_piastres"], layer["position_micros"], take)
-            start = layer["position_micros"]
-            end = start + take
-            new_remaining_qty = layer["original_qty_micros"] - end
-            new_remaining_cost = remaining_cost(layer["original_qty_micros"], layer["original_cost_piastres"], end)
-            conn.execute(
-                "UPDATE inventory_cost_layers SET position_micros=?,remaining_qty_micros=?,remaining_cost_piastres=?,"
-                "status=? WHERE id=?",
-                (end, new_remaining_qty, new_remaining_cost, "EXHAUSTED" if new_remaining_qty == 0 else "OPEN", layer["id"]),
-            )
-            result.append({"layer": layer, "quantity": take, "cost": cost, "start": start, "end": end})
-            left -= take
-        return result
+        return consume_lot_layers(conn, lot_id, quantity, reel_id)
 
     def issue_lot(self, lot_id: int, quantity: int, source_type: str = "SALE_ISSUE", source_id: int = 1,
                   occurred_at: str | None = None, actor_id: int | None = None) -> dict:

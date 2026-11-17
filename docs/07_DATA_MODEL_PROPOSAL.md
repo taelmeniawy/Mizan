@@ -137,7 +137,7 @@ erDiagram
 
 - للـ`REEL`: `original_qty_micros` = مجموع أطوال البكرات؛ `original_landed_cost` = مجموع تكاليفها.
 - للـ`LOT`: لا بكرات.
-- لدفعة `RETURN` (بكرة مرتجعة غير معروفة الأصل): `original_supplier_cost = 0`، و`original_landed_cost` = تكلفة المرتجع الفعلية، وتُسند البكرة بالكامل إلى `allocated_expense`؛ لا تُفسَّر كسعر مورد.
+- لدفعة `RETURN` (بكرة مرتجعة): `original_supplier_cost = 0`، و`original_landed_cost` = تكلفة المرتجع الفعلية، وتُسند البكرة بالكامل إلى `allocated_expense`؛ لا تُفسَّر كسعر مورد. كل مرتجع بكرة يُنشئ بكرة/طبقة جديدة، وتُربط البكرة الجديدة بالأصل عبر `source_reel_id` و`source_issue_allocation_id`؛ لا تُضاف الكمية إلى البكرة الأصلية (`OQ-INV-012`).
 - `status` (`OPEN`/`EXHAUSTED`/`RETURNED_TO_SUPPLIER`) وصف مشتق/مُتحقَّق؛ `EXHAUSTED` ليس نهائيًا إذا سمحت سياسة مرتجع/تسوية معتمدة بإنشاء طبقة متاحة (`OQ-INV-005`/`OQ-INV-012`).
 
 #### `inventory_cost_layers` — LCP
@@ -170,12 +170,12 @@ erDiagram
 
 #### `reels`
 
-`id`, `reel_no` UNIQUE, `lot_id`, `product_id`, `original_length_micros`, `supplier_cost_piastres`, `allocated_expense_piastres`, `original_cost_piastres`, `status`, `received_at`, `version`.
+`id`, `reel_no` UNIQUE, `lot_id`, `product_id`, `original_length_micros`, `supplier_cost_piastres`, `allocated_expense_piastres`, `original_cost_piastres`, `status`, `received_at`, `version`, `source_reel_id` NULL, `source_issue_allocation_id` NULL.
 
 - الطول/التكلفة **الأصليان فقط** هنا؛ `remaining_length/cost` مشتقان من `inventory_cost_layers`.
 - `reels` هي سجل الهوية الفيزيائية والأصل التاريخي، وليست رصيدًا متاحًا ثانيًا.
 - `lot.product_id = product_id` (Trigger/Service).
-- الحالة `SEALED/OPENED/EMPTY/RETURNED/DAMAGED` مشتقة/مُتحقَّقة (PROPOSED `OQ-INV-005`)، ولا تُعامل `EMPTY` كحالة نهائية إذا سمحت سياسة مرتجع/تسوية معتمدة بإنشاء طبقة متاحة.
+- الحالة `SEALED/OPENED/EMPTY/RETURNED/DAMAGED` مشتقة/مُتحقَّقة (PROPOSED `OQ-INV-005`)، ولا تُعامل `EMPTY` كحالة نهائية إذا سمحت تسوية معتمدة بإنشاء طبقة متاحة على البكرة نفسها. مرتجع العميل يُنشئ بكرة/طبقة جديدة ولا يعيد فتح الأصلية (`OQ-INV-012`).
 
 #### `stock_movements`
 
@@ -262,8 +262,8 @@ WHERE source_quotation_id IS NOT NULL
 
 - UNIQUE `(sales_return_id, line_no)`؛ يسمح بتقسيم نفس بند البيع إلى سطر قابل للبيع وآخر تالف.
 - مجموع الكميات ≤ المتبقي القابل للإرجاع.
-- **تدفق التالف المقترح:** `SALE_RETURN_IN` ينشئ طبقة مرتجع ثم `DAMAGE` يستهلكها في نفس المعاملة؛ لا تبقى كمية قابلة للبيع، وتظل الكمية/التكلفة قابلتين للتتبع. المعالجة المحاسبية (خسارة مباشرة أو `1210` ثم إعدام) **OPEN** (`OQ-INV-004`).
-- لا يُعتمد «قيد تكلفة فقط بلا حركة كمية» بديلًا إلا بعد إثبات اكتمال الكمية/التالف/حفظ التكلفة/تسوية الحركات؛ غير مثبت حاليًا.
+- **تدفق التالف المعتمد:** `SALE_RETURN_IN` ينشئ طبقة مرتجع ثم `DAMAGE` يستهلكها في نفس المعاملة؛ لا تبقى كمية قابلة للبيع، وتظل الكمية/التكلفة قابلتين للتتبع. تُقيَّد تكلفة التالف كخسارة مباشرة: مدين `5020` / دائن `5010`؛ لا `1210` ولا إعدام (`OQ-INV-004` محسوم 2026-11-17).
+- لا يُعتمد «قيد تكلفة فقط بلا حركة كمية» بديلًا؛ لم يُثبت اكتمال الكمية/التالف/حفظ التكلفة/تسوية الحركات.
 
 #### `sales_return_settlements` — PROPOSED
 

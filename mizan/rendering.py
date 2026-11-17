@@ -147,7 +147,7 @@ class A4QuotationRenderer:
             "الصافي (EGP)", "خصم (EGP)", "سعر الوحدة (EGP)",
             "الكمية", "الوحدة", "الوصف", "م",
         )
-        self._table_widths = (12, 10, 13, 9, 9, 42, 5)
+        self._table_widths = (12, 10, 13, 9, 9, 40, 7)
 
     # ------------------------------------------------------------------
     # Fonts and text formats
@@ -340,58 +340,120 @@ class A4QuotationRenderer:
     # Pagination
     # ------------------------------------------------------------------
 
-    def paginate(self, snapshot: dict) -> list[PagePlan]:
+    def _layout_pages(self, snapshot: dict) -> list[tuple[PagePlan, QTextDocument]]:
+        """Build page plans and their body documents once.
+
+        The first page uses a measured row-height estimate, then each accepted
+        page updates the estimate.  A narrower binary search is used only when
+        the estimate does not fit, which keeps long documents from rebuilding
+        the whole remaining document on every page.
+        """
         rows = tuple(snapshot.get("lines") or ())
         if not rows:
-            return [PagePlan((), True)]
-        pages: list[PagePlan] = []
+            document = self._body_document(snapshot, (), True)
+            return [(PagePlan((), True), document)]
+
+        shell_height = self._body_height(self._body_document(snapshot, (), False))
+        probe_count = min(5, len(rows))
+        probe_height = self._body_height(
+            self._body_document(snapshot, rows[:probe_count], False)
+        )
+        average_row = max(1.0, (probe_height - shell_height) / probe_count)
+        estimate = max(
+            1, int(max(0.0, BODY_HEIGHT_PT - shell_height) / average_row)
+        )
+        estimate = min(estimate, len(rows))
+
+        pages: list[tuple[PagePlan, QTextDocument]] = []
         remaining = list(rows)
         while remaining:
-            all_document = self._body_document(snapshot, tuple(remaining), True)
-            if self._fits(all_document):
-                pages.append(PagePlan(tuple(remaining), True))
-                remaining = []
-                break
+            if len(remaining) <= estimate:
+                last_document = self._body_document(snapshot, tuple(remaining), True)
+                if self._fits(last_document):
+                    pages.append((PagePlan(tuple(remaining), True), last_document))
+                    remaining = []
+                    break
 
-            low, high = 1, len(remaining)
-            best = 0
-            while low <= high:
-                middle = (low + high) // 2
-                candidate = self._body_document(snapshot, tuple(remaining[:middle]), False)
-                if self._fits(candidate):
-                    best = middle
-                    low = middle + 1
-                else:
-                    high = middle - 1
-            if best == 0:
-                best = 1  # oversized row: keep it whole and let the page clip
-            if best == len(remaining) and len(remaining) > 1:
-                best -= 1  # leave at least one row for the summary page
-            pages.append(PagePlan(tuple(remaining[:best]), False))
-            remaining = remaining[best:]
-
-        if pages and not pages[-1].include_summary:
-            last_rows = pages[-1].rows
-            merged = self._body_document(snapshot, last_rows, True)
-            if self._fits(merged):
-                pages[-1] = PagePlan(last_rows, True)
-            else:
-                summary_only = self._body_document(snapshot, (), True)
-                if not self._fits(summary_only):
-                    raise RendererError(
-                        "quotation summary is taller than one A4 page; "
-                        "shorten notes/terms or split the document"
+            candidate_count = min(estimate, len(remaining))
+            document = self._body_document(
+                snapshot, tuple(remaining[:candidate_count]), False
+            )
+            if not self._fits(document):
+                low, high = 1, candidate_count - 1
+                best = 0
+                best_document = None
+                while low <= high:
+                    middle = (low + high) // 2
+                    candidate = self._body_document(
+                        snapshot, tuple(remaining[:middle]), False
                     )
-                pages.append(PagePlan((), True))
+                    if self._fits(candidate):
+                        best = middle
+                        best_document = candidate
+                        low = middle + 1
+                    else:
+                        high = middle - 1
+                if best == 0:
+                    candidate_count = 1
+                    document = self._body_document(
+                        snapshot, tuple(remaining[:1]), False
+                    )
+                else:
+                    candidate_count = best
+                    document = best_document
+            pages.append(
+                (PagePlan(tuple(remaining[:candidate_count]), False), document)
+            )
+            remaining = remaining[candidate_count:]
+
+            height = self._body_height(document)
+            average = max(1.0, (height - shell_height) / candidate_count)
+            estimate = max(
+                1, int(max(0.0, BODY_HEIGHT_PT - shell_height) / average)
+            )
+            estimate = min(estimate, max(1, len(remaining)))
+
+        if pages and not pages[-1][0].include_summary:
+            plan, document = pages[-1]
+            merged = self._body_document(snapshot, plan.rows, True)
+            if self._fits(merged):
+                pages[-1] = (PagePlan(plan.rows, True), merged)
+            elif len(plan.rows) > 1:
+                # Keep the summary on the final page and move one row there;
+                # this avoids an otherwise blank summary-only page.
+                kept_rows = plan.rows[:-1]
+                moved_rows = plan.rows[-1:]
+                kept_document = self._body_document(snapshot, kept_rows, False)
+                moved_document = self._body_document(snapshot, moved_rows, True)
+                if self._fits(kept_document) and self._fits(moved_document):
+                    pages[-1] = (PagePlan(kept_rows, False), kept_document)
+                    pages.append((PagePlan(moved_rows, True), moved_document))
+                else:
+                    self._append_summary_only_page(snapshot, pages)
+            else:
+                self._append_summary_only_page(snapshot, pages)
         return pages
+
+    def _append_summary_only_page(self, snapshot: dict,
+                                  pages: list[tuple[PagePlan, QTextDocument]]) -> None:
+        summary_only = self._body_document(snapshot, (), True)
+        if not self._fits(summary_only):
+            raise RendererError(
+                "quotation summary is taller than one A4 page; "
+                "shorten notes/terms or split the document"
+            )
+        pages.append((PagePlan((), True), summary_only))
+
+    def paginate(self, snapshot: dict) -> list[PagePlan]:
+        return [plan for plan, _document in self._layout_pages(snapshot)]
 
     # ------------------------------------------------------------------
     # Shared page composition
     # ------------------------------------------------------------------
 
-    def _draw_page(self, painter: QPainter, snapshot: dict, plan: PagePlan, *,
-                   page_number: int, total_pages: int) -> None:
-        document = self._body_document(snapshot, plan.rows, plan.include_summary)
+    def _draw_page(self, painter: QPainter, snapshot: dict, plan: PagePlan,
+                   document: QTextDocument, *, page_number: int,
+                   total_pages: int) -> None:
         painter.save()
         painter.setClipRect(QRectF(MARGIN_PT, MARGIN_PT, CONTENT_WIDTH_PT, BODY_HEIGHT_PT))
         painter.translate(MARGIN_PT, MARGIN_PT)
@@ -421,7 +483,7 @@ class A4QuotationRenderer:
 
     def render_pdf(self, snapshot: dict, output_path: str | Path) -> RenderResult:
         ensure_qt_app()
-        plans = self.paginate(snapshot)
+        pages = self._layout_pages(snapshot)
         writer = QPdfWriter(str(output_path))
         writer.setPageSize(QPageSize(QPageSize.A4))
         writer.setPageMargins(QMarginsF(0, 0, 0, 0), QPageLayout.Millimeter)
@@ -433,20 +495,20 @@ class A4QuotationRenderer:
         if not painter.isActive():
             raise RendererError("could not start the PDF painter")
         try:
-            for index, plan in enumerate(plans):
+            for index, (plan, document) in enumerate(pages):
                 if index:
                     writer.newPage()
                 self._draw_page(
-                    painter, snapshot, plan,
-                    page_number=index + 1, total_pages=len(plans),
+                    painter, snapshot, plan, document,
+                    page_number=index + 1, total_pages=len(pages),
                 )
         finally:
             painter.end()
-        return RenderResult(len(plans), A4_WIDTH_PT, A4_HEIGHT_PT)
+        return RenderResult(len(pages), A4_WIDTH_PT, A4_HEIGHT_PT)
 
     def print_document(self, snapshot: dict, printer: QPrinter) -> RenderResult:
         ensure_qt_app()
-        plans = self.paginate(snapshot)
+        pages = self._layout_pages(snapshot)
         printer.setPageSize(QPageSize(QPageSize.A4))
         printer.setPageMargins(QMarginsF(0, 0, 0, 0), QPageLayout.Millimeter)
         printer.setFullPage(True)
@@ -455,19 +517,19 @@ class A4QuotationRenderer:
             raise RendererError("could not start the printer painter")
         scale = 72.0 / float(printer.resolution() or 72)
         try:
-            for index, plan in enumerate(plans):
+            for index, (plan, document) in enumerate(pages):
                 if index:
                     printer.newPage()
                 painter.save()
                 painter.scale(scale, scale)
                 self._draw_page(
-                    painter, snapshot, plan,
-                    page_number=index + 1, total_pages=len(plans),
+                    painter, snapshot, plan, document,
+                    page_number=index + 1, total_pages=len(pages),
                 )
                 painter.restore()
         finally:
             painter.end()
-        return RenderResult(len(plans), A4_WIDTH_PT, A4_HEIGHT_PT)
+        return RenderResult(len(pages), A4_WIDTH_PT, A4_HEIGHT_PT)
 
 
 def page_rects_pt():

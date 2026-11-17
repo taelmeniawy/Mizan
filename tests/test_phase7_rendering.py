@@ -147,6 +147,30 @@ def test_multipage_repeated_headers_and_row_pagination(render_shop):
             assert "الإجمالي المستحق" in normalized
 
 
+def test_100_plus_line_document_has_no_row_loss(render_shop):
+    shop, export = render_shop
+    line_count = 120
+    quote = shop.create_quote(lines=_lines(shop, line_count))
+    result = export.issue_official(quote, actor_id=shop.shop.manager)
+    report = read_pdf(export.store.resolve(result["relative_path"]))
+    snapshot = shop.documents.snapshot("QUOTATION", quote)
+    plans = export.renderer.paginate(snapshot)
+
+    _assert_a4(report)
+    assert report.page_count == result["pages"] == len(plans) >= 4
+    assert [plan.include_summary for plan in plans] == [False] * (len(plans) - 1) + [True]
+    assert all(plan.rows for plan in plans)
+
+    seen = [row["line_no"] for plan in plans for row in plan.rows]
+    assert len(seen) == line_count
+    assert len(set(seen)) == line_count
+    assert seen == list(range(1, line_count + 1))
+
+    # Every page carries the repeated table header and a page-numbered footer.
+    assert report.normalized_text.count("الوصف") == len(plans)
+    assert report.normalized_text.count("صفحة ") == len(plans)
+
+
 def test_stable_pagination_and_snapshot(render_shop, tmp_path):
     shop, export = render_shop
     quote = shop.create_quote(lines=_lines(shop, 40))

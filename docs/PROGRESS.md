@@ -61,11 +61,27 @@
 - Official export records path, SHA-256, file size, template/renderer versions and `is_official=1`; reprint returns the same file/hash; deleting the file makes reprint and print fail without regeneration.
 - A `QPrinter` PDF-output test confirms the printer path uses the same page composer/layout; it is not a physical-printer test.
 
+### Long-document / performance check (2026-11-17)
+
+Measured with the project-local `.venv` on this Windows machine (Python 3.12.10, PySide6-Essentials 6.12.0), three runs per size. Times are descriptive, not pass/fail thresholds; `render` is `render_pdf` (pagination + PDF writing) in seconds.
+
+| Line items | Pages | Rows/page | Median paginate | Median render | PDF size |
+|---:|---:|---|---:|---:|---:|
+| 100 | 4 | 30/30/30/10 | 2.85s | 3.01s | 28.3 KB |
+| 250 | 9 | 30×8, 10 | 4.51s | 4.69s | 48.1 KB |
+
+Correctness on both sizes: every line appears exactly once in the page plans, no rows are lost, each page has A4 MediaBox 595×842pt (±1), and the repeated table header/footer appear once per page. The new 120-line regression test asserts the same invariants deterministically.
+
+Concrete defects found and fixed in this check:
+
+- **Serial-column wrap:** the line-number column was too narrow (5%), so 3-digit serials began wrapping, row heights increased, and rows/page dropped to 18–21; a 250-line document produced 12 pages. Widening the serial column to 7% restored 30 rows/page and reduced the 250-line document to 9 pages.
+- **Pagination cost:** the previous paginator rebuilt the entire remaining document plus summary and used a broad binary search on every page, taking roughly 9–10s for 100 lines and ~39s for 250. The paginator now uses a measured row-height estimate, a narrow fallback search only when the estimate does not fit, and reuses the built page documents for PDF/print output. It preserves the same page-plan invariants but is substantially faster; there is no timing threshold in the tests.
+
 ### Tests (actual result)
 
 - Phase 7 quotation tests: `24 passed` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_quotations.py -q`.
-- Phase 7 rendering tests: `9 passed, 1 skipped` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_rendering.py -q`. The skip is the real A4-printer check because no physical printer is available.
-- Full suite: **`134 passed, 1 skipped`** — `.venv\Scripts\python.exe -m pytest -q` (run 2026-11-17, project-local `.venv`, Python 3.12.10, pytest 9.2.0, PySide6-Essentials 6.12.0).
+- Phase 7 rendering tests: `10 passed, 1 skipped` — `.venv\Scripts\python.exe -m pytest tests/test_phase7_rendering.py -q`. The skip is the real A4-printer check because no physical printer is available.
+- Full suite: **`135 passed, 1 skipped`** — `.venv\Scripts\python.exe -m pytest -q` (run 2026-11-17, project-local `.venv`, Python 3.12.10, pytest 9.2.0, PySide6-Essentials 6.12.0).
 - The older quotation issue tests still use a test-double export row; the rendering tests exercise the real renderer/export/PDF path.
 
 ### Implementation notes / deviations
@@ -84,7 +100,6 @@
 - **T-DOC-009:** real A4 printer test. The machine currently exposes only Microsoft Print to PDF, Microsoft XPS Document Writer, and Fax; **T-DOC-010** confirms Print to PDF is not a substitute.
 - **T-DOC-007:** golden image/reference template after font/template approval.
 - **T-QUO-019 / AC-QUO-003:** logo-change historical behavior; no logo asset exists yet (`OQ-DOC-002`).
-- **Performance:** a 60-line multi-page document was rendered, but formal 100+ line performance measurement (ADR-0004 check #11) is not part of this slice.
 - The full Phase 7 exit criteria in `docs/11_IMPLEMENTATION_ROADMAP.md` remain unchanged. **Phase 8 must not start until they all pass.**
 
 

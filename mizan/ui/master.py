@@ -2,21 +2,15 @@
 
 from __future__ import annotations
 
-from contextlib import closing
-
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QPushButton,
     QTabWidget,
-    QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -24,41 +18,19 @@ from PySide6.QtWidgets import (
 from ..bootstrap import AppContext
 from ..master import MasterDataService
 from .common import (
+    fill_table,
     make_card,
-    make_hint,
     make_message,
     make_subtitle,
+    make_table,
     make_title,
+    query_rows,
     set_message,
 )
+from .pricing import PricingTab
 
 CUSTOMER_TYPES = (("RETAIL", "تجزئة"), ("WHOLESALE", "جملة"), ("CONTRACTOR", "مقاول"))
 TRACKING_MODES = (("LOT", "دفعة LOT"), ("REEL", "بكرة REEL"))
-
-
-def _table(headers: list[str]) -> QTableWidget:
-    table = QTableWidget(0, len(headers))
-    table.setHorizontalHeaderLabels(headers)
-    table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-    table.setSelectionBehavior(QAbstractItemView.SelectRows)
-    table.setSelectionMode(QAbstractItemView.SingleSelection)
-    table.verticalHeader().setVisible(False)
-    table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-    return table
-
-
-def _fill(table: QTableWidget, rows: list[tuple]) -> None:
-    table.setRowCount(len(rows))
-    for row_index, values in enumerate(rows):
-        for column, value in enumerate(values):
-            item = QTableWidgetItem(str(value))
-            item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            table.setItem(row_index, column, item)
-
-
-def _rows(context: AppContext, sql: str, params: tuple = ()) -> list[tuple]:
-    with closing(context.db.connect()) as conn:
-        return [tuple(row) for row in conn.execute(sql, params)]
 
 
 class UnitsTab(QWidget):
@@ -88,7 +60,7 @@ class UnitsTab(QWidget):
 
         self.message = make_message()
         layout.addWidget(self.message)
-        self.table = _table(["الكود", "الاسم", "تسمح بكسور"])
+        self.table = make_table(["الكود", "الاسم", "تسمح بكسور"])
         layout.addWidget(self.table, 1)
         self.refresh()
 
@@ -106,9 +78,9 @@ class UnitsTab(QWidget):
         return True
 
     def refresh(self) -> None:
-        _fill(self.table, [
+        fill_table(self.table, [
             (code, name, "نعم" if fraction else "لا")
-            for code, name, fraction in _rows(
+            for code, name, fraction in query_rows(
                 self.context, "SELECT code,name_ar,allows_fraction FROM units ORDER BY code"
             )
         ])
@@ -155,7 +127,7 @@ class ProductsTab(QWidget):
 
         self.message = make_message()
         layout.addWidget(self.message)
-        self.table = _table(["الكود", "الاسم", "الوحدة", "التتبع", "الحالة"])
+        self.table = make_table(["الكود", "الاسم", "الوحدة", "التتبع", "الحالة"])
         layout.addWidget(self.table, 1)
         self.refresh()
 
@@ -199,7 +171,7 @@ class ProductsTab(QWidget):
     def refresh(self) -> None:
         current = self.unit.currentData()
         self.unit.clear()
-        for code, name in _rows(
+        for code, name in query_rows(
             self.context,
             "SELECT u.code,u.name_ar FROM units u WHERE u.is_active=1 ORDER BY u.code",
         ):
@@ -208,12 +180,12 @@ class ProductsTab(QWidget):
             index = self.unit.findData(current)
             if index >= 0:
                 self.unit.setCurrentIndex(index)
-        rows = _rows(
+        rows = query_rows(
             self.context,
             "SELECT p.id,p.code,p.name_ar,u.name_ar,p.tracking_mode,p.is_active "
             "FROM products p JOIN units u ON u.id=p.base_unit_id ORDER BY p.code",
         )
-        _fill(self.table, [
+        fill_table(self.table, [
             (code, name, unit, "بكرة" if tracking == "REEL" else "دفعة",
              "نشط" if active else "معطّل")
             for _id, code, name, unit, tracking, active in rows
@@ -252,7 +224,7 @@ class CustomersTab(QWidget):
         layout.addLayout(form)
         self.message = make_message()
         layout.addWidget(self.message)
-        self.table = _table(["الكود", "الاسم", "النوع"])
+        self.table = make_table(["الكود", "الاسم", "النوع"])
         layout.addWidget(self.table, 1)
         self.refresh()
 
@@ -271,9 +243,9 @@ class CustomersTab(QWidget):
 
     def refresh(self) -> None:
         labels = dict(CUSTOMER_TYPES)
-        _fill(self.table, [
+        fill_table(self.table, [
             (code, name, labels.get(customer_type, customer_type))
-            for code, name, customer_type in _rows(
+            for code, name, customer_type in query_rows(
                 self.context,
                 "SELECT code,name_ar,customer_type FROM customers ORDER BY code",
             )
@@ -303,7 +275,7 @@ class SuppliersTab(QWidget):
         layout.addLayout(form)
         self.message = make_message()
         layout.addWidget(self.message)
-        self.table = _table(["الكود", "الاسم"])
+        self.table = make_table(["الكود", "الاسم"])
         layout.addWidget(self.table, 1)
         self.refresh()
 
@@ -320,7 +292,7 @@ class SuppliersTab(QWidget):
         return True
 
     def refresh(self) -> None:
-        _fill(self.table, _rows(
+        fill_table(self.table, query_rows(
             self.context, "SELECT code,name_ar FROM suppliers ORDER BY code"
         ))
 
@@ -351,7 +323,7 @@ class ProjectsTab(QWidget):
         layout.addLayout(form)
         self.message = make_message()
         layout.addWidget(self.message)
-        self.table = _table(["الكود", "الاسم", "المقاول"])
+        self.table = make_table(["الكود", "الاسم", "المقاول"])
         layout.addWidget(self.table, 1)
         self.refresh()
 
@@ -374,7 +346,7 @@ class ProjectsTab(QWidget):
     def refresh(self) -> None:
         current = self.contractor.currentData()
         self.contractor.clear()
-        for customer_id, label in _rows(
+        for customer_id, label in query_rows(
             self.context,
             "SELECT id,code||' — '||name_ar FROM customers "
             "WHERE customer_type='CONTRACTOR' AND is_active=1 ORDER BY code",
@@ -384,7 +356,7 @@ class ProjectsTab(QWidget):
             index = self.contractor.findData(current)
             if index >= 0:
                 self.contractor.setCurrentIndex(index)
-        _fill(self.table, _rows(
+        fill_table(self.table, query_rows(
             self.context,
             "SELECT pr.code,pr.name_ar,c.name_ar FROM projects pr "
             "JOIN customers c ON c.id=pr.customer_id ORDER BY pr.code",
@@ -403,6 +375,7 @@ class MasterDataPage(QWidget):
         self.customers: CustomersTab | None = None
         self.suppliers: SuppliersTab | None = None
         self.projects: ProjectsTab | None = None
+        self.pricing: PricingTab | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(26, 22, 26, 22)
@@ -431,12 +404,12 @@ class MasterDataPage(QWidget):
         if context.has_permission(user_id, "manage_projects"):
             self.projects = ProjectsTab(context)
             self.tabs.addTab(self.projects, "المشاريع")
+        if context.has_permission(user_id, "manage_price_lists"):
+            self.pricing = PricingTab(context, user_id)
+            self.tabs.addTab(self.pricing, "أسعار البيع")
         if self.tabs.count() == 0:
             self.tabs.addTab(QWidget(), "لا توجد صلاحيات للبيانات الأساسية")
         card_layout.addWidget(self.tabs)
-        card_layout.addWidget(make_hint(
-            "أسعار البيع (الافتراضي/قوائم الأسعار/أسعار العملاء) وشاشات المشتريات والمبيعات في الخطوات التالية."
-        ))
         layout.addWidget(card, 1)
         self.tabs.currentChanged.connect(self._refresh_current)
 
@@ -447,6 +420,8 @@ class MasterDataPage(QWidget):
             refresh()
 
     def refresh(self) -> None:
-        for tab in (self.units, self.products, self.customers, self.suppliers, self.projects):
+        for tab in (
+            self.units, self.products, self.customers, self.suppliers, self.projects, self.pricing,
+        ):
             if tab is not None:
                 tab.refresh()

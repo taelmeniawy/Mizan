@@ -1,6 +1,52 @@
-# Packaging notes — bundled Noto Naskh Arabic
+# Windows packaging
 
-**Status:** Phase 7 font packaging notes; full application packaging/signing remains Phase 10.
+The Phase 10 installer is a Windows x64 build. It installs for the current
+user under `%LOCALAPPDATA%\Programs\Mizan`, adds a Start menu shortcut, and
+registers Mizan in Installed apps. Python and Qt are included.
+
+## Install and update
+
+1. Run `Mizan-<version>-win-x64-setup.exe` and open **Mizan** from Start.
+2. On a new profile, complete the first-run store and Owner setup. The default
+   data directory is `%LOCALAPPDATA%\Mizan`.
+3. Before an update, create a backup in Mizan, close the app, then run the new
+   installer. The installer replaces the previous program files and reuses
+   the existing data on the next launch.
+
+Remove Mizan from Windows **Installed apps**. The uninstaller removes the
+program and shortcut while preserving the database, documents and backups.
+If Windows blocks the shortcut or registration, open `Mizan.exe` or
+`Uninstall.exe` directly in `%LOCALAPPDATA%\Programs\Mizan`.
+Keep the previous installer with the backup when testing a version that
+changes the database schema.
+
+## Build on Windows x64
+
+Use standard x64 Python 3.12 and the [NSIS 3 compiler](https://nsis.sourceforge.io/Download).
+From the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[windows-build]"
+.\.venv\Scripts\python.exe packaging/windows/build.py --makensis 'C:\path\to\makensis.exe'
+```
+
+The installer and its SHA-256 checksum are written to `artifacts/windows/`.
+The standalone bundle and PyInstaller analysis are in that build's
+`build-*/` directory. The installer is currently a local, unsigned build.
+
+For the installer smoke test, add `--test-install` to the build command to
+use a separate app registration. Run the test in an interactive Windows
+session so it can detect the packaged Qt window:
+
+```powershell
+.\.venv\Scripts\python.exe packaging/windows/smoke.py artifacts/windows/MizanPackagingTest-0.1.0-win-x64-setup.exe
+```
+
+The test installs to a temporary directory within the artifacts folder,
+launches the app with a fresh data profile, replaces the installation, then
+removes it and compares the preserved test data.
+Use `--files-only` to test those operations in an environment that blocks
+registration in Windows. Run the default test on the acceptance machine.
 
 ## Bundled assets
 
@@ -34,15 +80,6 @@ mizan = ["assets/fonts/NotoNaskhArabic/*"]
 renderer loads the faces with `importlib.resources.files("mizan")` and
 `QFontDatabase.addApplicationFont`, not from the current working directory.
 
-Verification performed: install the project into a temporary target and load
-the font from that installed package:
-
-```powershell
-.\\.venv\\Scripts\\python.exe -m pip install --no-deps --target .\tmp_pkg .
-# run from tmp_pkg (or with tmp_pkg on PYTHONPATH) so the source tree cannot shadow it
-.\\.venv\\Scripts\\python.exe -c "from mizan.rendering import load_bundled_fonts; print(load_bundled_fonts())"
-```
-
 ## Application entry point
 
 The desktop shell is started with:
@@ -59,29 +96,13 @@ default is `%LOCALAPPDATA%\Mizan`; `MIZAN_DATA_DIR` overrides it.
 
 ## PyInstaller
 
-When the Windows executable is built in Phase 10, include the package data
-explicitly; do not rely on the development tree being present:
-
-```text
---add-data "mizan/assets;mizan/assets"
-```
-
-or in a `.spec` file:
-
-```python
-datas=[("mizan/assets", "mizan/assets")]
-```
-
-The `LICENCE` and `SOURCE.md` files must ship with the executable's bundled
-assets. The font is loaded from `importlib.resources`, so the PyInstaller data
-destination must keep the `mizan/assets/...` relative layout.
+The build passes `mizan/assets` to PyInstaller at the same relative path so
+that `importlib.resources` can load the Arabic font with its `LICENCE` and
+`SOURCE.md` files. The standalone directory keeps the Qt runtime, including
+the Windows platform plugin, alongside the application.
 
 ## Remaining packaging work
 
-- Actual PyInstaller executable build, clean-machine install, and code signing
-  are Phase 10 work and are not claimed here.
-- The Qt widget shell needs the PySide6 platform plugins (PyInstaller's PySide6
-  hooks normally collect them). Verify the built executable starts the login
-  screen with a temporary `--data-dir` before shipping.
-- The renderer uses the bundled font for Arabic; Qt may use a system fallback for
-  Latin characters/codes/punctuation that Noto Naskh Arabic does not contain.
+- Run the installer acceptance checks on a clean Windows x64 machine.
+- Complete code signing and the third-party distribution notice review before
+  publishing a release.

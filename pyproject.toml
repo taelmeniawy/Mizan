@@ -13,6 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+windows-build = ["pyinstaller==6.22.3; sys_platform == 'win32'"]
 
 [project.gui-scripts]
 mizan = "mizan.app:main"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 from datetime import date, datetime, timezone
 
 from .accounting import AccountingService
@@ -11,9 +12,11 @@ from .inventory import (
     create_layer,
     create_movement,
     refresh_lot_status,
+    refresh_reel_status,
 )
 from .lcp import allocate_largest_remainder, line_total
 from .numbering import next_number
+from .pricing import base_quantity
 
 
 def _now() -> str:
@@ -31,37 +34,29 @@ class PurchasingService:
             raise ValueError("product not found")
         return row
 
-    def _conversion(self, conn, product, unit_id: int) -> tuple[int, int]:
-        if unit_id == product["base_unit_id"]:
-            return 1, 1
-        row = conn.execute(
-            "SELECT factor_num,factor_den FROM product_unit_conversions WHERE product_id=? AND unit_id=?",
-            (product["id"], unit_id),
-        ).fetchone()
-        if row is None:
-            raise ValueError("no conversion for unit")
-        return row["factor_num"], row["factor_den"]
-
-    def _base_qty(self, conn, product, unit_id: int, quantity_micros: int) -> int:
-        if quantity_micros <= 0:
-            raise ValueError("quantity must be positive")
-        num, den = self._conversion(conn, product, unit_id)
-        base, remainder = divmod(quantity_micros * num, den)
-        if remainder:
-            raise ValueError("conversion does not produce an integer base quantity")
-        unit = conn.execute("SELECT allows_fraction FROM units WHERE id=?", (product["base_unit_id"],)).fetchone()
-        if not unit["allows_fraction"] and base % 1_000_000:
-            raise ValueError("base unit does not allow fractional quantities")
-        return base
-
-    @staticmethod
-    def _line_total(price_micros: int, quantity_micros: int) -> int:
-        return line_total(price_micros, quantity_micros)
-
     def create_invoice(self, supplier_id: int, invoice_date: str, lines: list[dict], expense_piastres: int = 0,
                        payment_type: str = "CREDIT", supplier_invoice_no: str | None = None,
                        financial_account_id: int | None = None, created_by: int | None = None,
                        *, due_date: str | None = None) -> int:
+        return self._save_invoice(
+            supplier_id, invoice_date, lines, expense_piastres, payment_type,
+            supplier_invoice_no, financial_account_id, due_date, created_by=created_by,
+        )
+
+    def update_invoice(self, invoice_id: int, supplier_id: int, invoice_date: str, lines: list[dict],
+                       expense_piastres: int = 0, payment_type: str = "CREDIT",
+                       supplier_invoice_no: str | None = None, financial_account_id: int | None = None,
+                       *, due_date: str | None = None, actor_id: int) -> None:
+        PermissionService(self.db).require(actor_id, "post_purchases")
+        self._save_invoice(
+            supplier_id, invoice_date, lines, expense_piastres, payment_type,
+            supplier_invoice_no, financial_account_id, due_date, invoice_id=invoice_id,
+        )
+
+    def _save_invoice(self, supplier_id: int, invoice_date: str, lines: list[dict],
+                      expense_piastres: int, payment_type: str, supplier_invoice_no: str | None,
+                      financial_account_id: int | None, due_date: str | None,
+                      *, invoice_id: int | None = None, created_by: int | None = None) -> int:
         if not lines:
             raise ValueError("invoice needs lines")
         if expense_piastres < 0:
@@ -73,19 +68,37 @@ class PurchasingService:
         with self.db.transaction() as conn:
             if conn.execute("SELECT 1 FROM suppliers WHERE id=?", (supplier_id,)).fetchone() is None:
                 raise ValueError("supplier not found")
-            document_no = next_number(conn, "PURCHASE_INVOICE", int(invoice_date[:4]), "PI-")
-            cur = conn.execute(
-                "INSERT INTO purchase_invoices(document_no,supplier_id,supplier_invoice_no,invoice_date,"
-                "due_date,payment_type,financial_account_id,expense_piastres,created_by) VALUES(?,?,?,?,?,?,?,?,?)",
-                (document_no, supplier_id, supplier_invoice_no, invoice_date, due_date,
-                 payment_type, financial_account_id, expense_piastres, created_by),
-            )
-            invoice_id = int(cur.lastrowid)
+            header = (supplier_id, supplier_invoice_no, invoice_date, due_date,
+                      payment_type, financial_account_id, expense_piastres)
+            if invoice_id is None:
+                document_no = next_number(conn, "PURCHASE_INVOICE", int(invoice_date[:4]), "PI-")
+                cursor = conn.execute(
+                    "INSERT INTO purchase_invoices(document_no,supplier_id,supplier_invoice_no,invoice_date,"
+                    "due_date,payment_type,financial_account_id,expense_piastres,created_by) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (document_no, *header, created_by),
+                )
+                invoice_id = int(cursor.lastrowid)
+            else:
+                cursor = conn.execute(
+                    "UPDATE purchase_invoices SET supplier_id=?,supplier_invoice_no=?,invoice_date=?,"
+                    "due_date=?,payment_type=?,financial_account_id=?,expense_piastres=? "
+                    "WHERE id=? AND status='DRAFT'",
+                    (*header, invoice_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("draft purchase invoice not found")
+                conn.execute(
+                    "DELETE FROM purchase_reel_inputs WHERE purchase_invoice_line_id IN "
+                    "(SELECT id FROM purchase_invoice_lines WHERE purchase_invoice_id=?)",
+                    (invoice_id,),
+                )
+                conn.execute("DELETE FROM purchase_invoice_lines WHERE purchase_invoice_id=?", (invoice_id,))
             subtotal = 0
             for index, line in enumerate(lines, start=1):
                 product = self._product(conn, line["product_id"])
-                base_qty = self._base_qty(conn, product, line["unit_id"], line["quantity_micros"])
-                total = self._line_total(line["unit_price_micros"], line["quantity_micros"])
+                base_qty, _, _ = base_quantity(conn, product, line["unit_id"], line["quantity_micros"])
+                total = line_total(line["unit_price_micros"], line["quantity_micros"])
                 conn.execute(
                     "INSERT INTO purchase_invoice_lines(purchase_invoice_id,line_no,product_id,unit_id,quantity_micros,base_qty_micros,unit_price_micros,supplier_line_total_piastres,net_piastres,tracking_mode) "
                     "VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -196,11 +209,12 @@ class PurchasingService:
                 if invoice["financial_account_id"] is None:
                     raise ValueError("cash purchase requires a financial account")
                 gl = conn.execute(
-                    "SELECT a.code FROM financial_accounts f JOIN accounts a ON a.id=f.gl_account_id WHERE f.id=?",
+                    "SELECT a.code FROM financial_accounts f JOIN accounts a ON a.id=f.gl_account_id "
+                    "WHERE f.id=? AND f.is_active=1 AND a.account_type='ASSET' AND a.is_control=0",
                     (invoice["financial_account_id"],),
                 ).fetchone()
                 if gl is None:
-                    raise ValueError("financial account not found")
+                    raise ValueError("active financial account not found")
                 journal_lines.append({"account_code": gl["code"], "credit": total})
             else:
                 journal_lines.append({"account_code": "2010", "credit": subtotal, "party_type": "SUPPLIER", "party_id": invoice["supplier_id"]})
@@ -215,6 +229,34 @@ class PurchasingService:
                 (_now(), journal_id, invoice_id),
             )
             return {"invoice_id": invoice_id, "journal_id": journal_id, "total": total}
+
+    @staticmethod
+    def _supplier_invoice_balances(conn, supplier_id: int, payment_date: str):
+        return conn.execute(
+            "SELECT i.id AS purchase_invoice_id,i.document_no,i.invoice_date,"
+            " i.subtotal_piastres - COALESCE(("
+            " SELECT SUM(r.total_piastres) FROM purchase_returns r"
+            " JOIN journal_entries j ON j.id=r.journal_entry_id"
+            " WHERE r.purchase_invoice_id=i.id AND r.status='POSTED' AND j.reversed_by_id IS NULL),0)"
+            " - COALESCE(("
+            " SELECT SUM(a.amount_piastres) FROM supplier_payment_allocations a"
+            " JOIN supplier_payments p ON p.id=a.payment_id"
+            " JOIN journal_entries j ON j.id=p.journal_entry_id"
+            " WHERE a.purchase_invoice_id=i.id AND j.reversed_by_id IS NULL),0) AS outstanding_piastres"
+            " FROM purchase_invoices i JOIN journal_entries e ON e.id=i.journal_entry_id"
+            " WHERE i.supplier_id=? AND i.status='POSTED' AND i.payment_type='CREDIT'"
+            " AND e.entry_date<=? AND e.reversed_by_id IS NULL"
+            " ORDER BY COALESCE(NULLIF(i.due_date,''), i.invoice_date),i.id",
+            (supplier_id, payment_date),
+        )
+
+    def supplier_payment_candidates(self, supplier_id: int, payment_date: str) -> list[dict]:
+        """Open invoices eligible on the payment date, net of all live settlements."""
+        with closing(self.db.connect()) as conn:
+            return [
+                dict(row) for row in self._supplier_invoice_balances(conn, supplier_id, payment_date)
+                if row["outstanding_piastres"] > 0
+            ]
 
     def post_supplier_payment(self, supplier_id: int, financial_account_id: int, payment_date: str,
                               allocations: list[dict], *, reference: str, actor_id: int) -> dict:
@@ -248,25 +290,15 @@ class PurchasingService:
             if account is None:
                 raise ValueError("active financial account not found")
 
+            balances = {
+                row["purchase_invoice_id"]: row["outstanding_piastres"]
+                for row in self._supplier_invoice_balances(conn, supplier_id, payment_date)
+            }
             for invoice_id, amount in amounts.items():
-                outstanding = conn.execute(
-                    "SELECT i.subtotal_piastres - COALESCE(("
-                    " SELECT SUM(r.total_piastres) FROM purchase_returns r"
-                    " JOIN journal_entries j ON j.id=r.journal_entry_id"
-                    " WHERE r.purchase_invoice_id=i.id AND r.status='POSTED' AND j.reversed_by_id IS NULL),0)"
-                    " - COALESCE(("
-                    " SELECT SUM(a.amount_piastres) FROM supplier_payment_allocations a"
-                    " JOIN supplier_payments p ON p.id=a.payment_id"
-                    " JOIN journal_entries j ON j.id=p.journal_entry_id"
-                    " WHERE a.purchase_invoice_id=i.id AND j.reversed_by_id IS NULL),0)"
-                    " FROM purchase_invoices i JOIN journal_entries e ON e.id=i.journal_entry_id"
-                    " WHERE i.id=? AND i.supplier_id=? AND i.status='POSTED' AND i.payment_type='CREDIT'"
-                    " AND e.entry_date<=? AND e.reversed_by_id IS NULL",
-                    (invoice_id, supplier_id, payment_date),
-                ).fetchone()
+                outstanding = balances.get(invoice_id)
                 if outstanding is None:
                     raise ValueError("allocation requires a posted credit invoice for this supplier by the payment date")
-                if amount > outstanding[0]:
+                if amount > outstanding:
                     raise ValueError("allocation exceeds invoice outstanding balance")
 
             ledger = conn.execute(
@@ -470,67 +502,122 @@ class PurchasingService:
             self._refresh_lot_status(conn, reel["lot_id"])
             return {"movement_id": movement_id, "cost": total_cost, "journal_id": journal}
 
-    def create_purchase_return(self, invoice_id: int, lines: list[dict], return_date: str, reason: str | None = None) -> int:
+    def create_purchase_return(self, invoice_id: int, lines: list[dict], return_date: str,
+                               reason: str | None = None) -> int:
         with self.db.transaction() as conn:
-            invoice = conn.execute("SELECT * FROM purchase_invoices WHERE id=? AND status='POSTED'", (invoice_id,)).fetchone()
-            if invoice is None:
-                raise ValueError("posted purchase invoice not found")
-            document_no = next_number(conn, "PURCHASE_RETURN", int(return_date[:4]), "PR-")
-            cur = conn.execute(
-                "INSERT INTO purchase_returns(document_no,purchase_invoice_id,supplier_id,return_date,reason) VALUES(?,?,?,?,?)",
-                (document_no, invoice_id, invoice["supplier_id"], return_date, reason),
-            )
-            return_id = int(cur.lastrowid)
-            for line in lines:
-                conn.execute(
-                    "INSERT INTO purchase_return_lines(purchase_return_id,purchase_invoice_line_id,lot_id,reel_id,quantity_micros) "
-                    "VALUES(?,?,?,?,?)",
-                    (return_id, line["purchase_invoice_line_id"], line["lot_id"], line.get("reel_id"), line["quantity_micros"]),
-                )
-            return return_id
+            return self._create_purchase_return(conn, invoice_id, lines, return_date, reason)
 
     def post_purchase_return(self, return_id: int, actor_id: int | None = None) -> dict:
         if actor_id is not None:
             PermissionService(self.db).require(actor_id, "post_purchase_return")
         with self.db.transaction() as conn:
-            ret = conn.execute("SELECT * FROM purchase_returns WHERE id=? AND status='DRAFT'", (return_id,)).fetchone()
-            if ret is None:
-                raise ValueError("draft purchase return not found")
-            lines = conn.execute("SELECT * FROM purchase_return_lines WHERE purchase_return_id=?", (return_id,)).fetchall()
-            total = 0
-            for line in lines:
-                lot = conn.execute("SELECT * FROM purchase_lots WHERE id=?", (line["lot_id"],)).fetchone()
-                if lot is None:
-                    raise InventoryError("lot not found")
-                parts = self._consume(conn, line["lot_id"], line["quantity_micros"], line["reel_id"])
-                cost = sum(part["cost"] for part in parts)
-                movement_id = self._create_movement(
-                    conn, "PURCHASE_RETURN", lot["product_id"], line["lot_id"], line["reel_id"], line["quantity_micros"], cost, "OUT",
-                    "PURCHASE_RETURN", return_id, ret["return_date"], actor_id, line["purchase_invoice_line_id"],
-                )
-                for part in parts:
-                    table = "reel_allocations" if line["reel_id"] else "lot_allocations"
-                    scope_col = "reel_id" if line["reel_id"] else "lot_id"
-                    scope_val = line["reel_id"] if line["reel_id"] else line["lot_id"]
-                    conn.execute(
-                        f"INSERT INTO {table}(stock_movement_id,cost_layer_id,{scope_col},purchase_return_line_id,allocation_role,quantity_micros,cost_piastres,direction,layer_position_start_micros,layer_position_end_micros) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (movement_id, part["layer"]["id"], scope_val, line["id"], "PURCHASE_RETURN", part["quantity"], part["cost"], "OUT", part["start"], part["end"]),
-                    )
-                conn.execute("UPDATE purchase_return_lines SET cost_piastres=? WHERE id=?", (cost, line["id"]))
-                self._refresh_lot_status(conn, line["lot_id"])
-                total += cost
-            journal = self.accounting.post_journal(
-                ret["return_date"], "PURCHASE_RETURN", return_id,
-                [{"account_code": "2010", "debit": total, "party_type": "SUPPLIER", "party_id": ret["supplier_id"]},
-                 {"account_code": "1200", "credit": total}],
-                description=f"مرتجع شراء {ret['document_no']}", posted_by=actor_id, conn=conn,
-            )
+            return self._post_purchase_return(conn, return_id, actor_id)
+
+    def return_credit_purchase(self, invoice_id: int, lines: list[dict], return_date: str,
+                               *, reason: str, actor_id: int) -> dict:
+        """Create and post a credit purchase return together, or leave no document."""
+        PermissionService(self.db).require(actor_id, "post_purchase_return")
+        if not reason.strip():
+            raise ValueError("purchase return requires a reason")
+        with self.db.transaction() as conn:
+            invoice = conn.execute(
+                "SELECT payment_type FROM purchase_invoices WHERE id=?", (invoice_id,),
+            ).fetchone()
+            if invoice is None or invoice["payment_type"] != "CREDIT":
+                raise ValueError("return requires a credit purchase invoice")
+            return_id = self._create_purchase_return(conn, invoice_id, lines, return_date, reason)
+            result = self._post_purchase_return(conn, return_id, actor_id)
+            document_no = conn.execute(
+                "SELECT document_no FROM purchase_returns WHERE id=?", (return_id,),
+            ).fetchone()[0]
+            return result | {"document_no": document_no}
+
+    @staticmethod
+    def _create_purchase_return(conn, invoice_id: int, lines: list[dict], return_date: str,
+                                reason: str | None) -> int:
+        if not lines:
+            raise ValueError("purchase return needs lines")
+        invoice = conn.execute(
+            "SELECT p.*,j.entry_date FROM purchase_invoices p JOIN journal_entries j ON j.id=p.journal_entry_id "
+            "WHERE p.id=? AND p.status='POSTED' AND j.reversed_by_id IS NULL", (invoice_id,),
+        ).fetchone()
+        if invoice is None:
+            raise ValueError("posted purchase invoice not found")
+        if date.fromisoformat(return_date) < date.fromisoformat(invoice["entry_date"][:10]):
+            raise ValueError("return date is before the original invoice")
+        document_no = next_number(conn, "PURCHASE_RETURN", int(return_date[:4]), "PR-")
+        cur = conn.execute(
+            "INSERT INTO purchase_returns(document_no,purchase_invoice_id,supplier_id,return_date,reason) VALUES(?,?,?,?,?)",
+            (document_no, invoice_id, invoice["supplier_id"], return_date, reason),
+        )
+        return_id = int(cur.lastrowid)
+        for line in lines:
             conn.execute(
-                "UPDATE purchase_returns SET status='POSTED', total_piastres=?, posted_at=?, journal_entry_id=? WHERE id=?",
-                (total, _now(), journal, return_id),
+                "INSERT INTO purchase_return_lines(purchase_return_id,purchase_invoice_line_id,lot_id,reel_id,quantity_micros) "
+                "VALUES(?,?,?,?,?)",
+                (return_id, line["purchase_invoice_line_id"], line["lot_id"], line.get("reel_id"), line["quantity_micros"]),
             )
-            return {"return_id": return_id, "total": total, "journal_id": journal}
+        return return_id
+
+    def _post_purchase_return(self, conn, return_id: int, actor_id: int | None) -> dict:
+        ret = conn.execute(
+            "SELECT r.* FROM purchase_returns r JOIN purchase_invoices p ON p.id=r.purchase_invoice_id "
+            "JOIN journal_entries j ON j.id=p.journal_entry_id "
+            "WHERE r.id=? AND r.status='DRAFT' AND p.status='POSTED' AND j.reversed_by_id IS NULL "
+            "AND r.return_date>=substr(j.entry_date,1,10) AND r.supplier_id=p.supplier_id", (return_id,),
+        ).fetchone()
+        if ret is None:
+            raise ValueError("draft purchase return not found")
+        lines = conn.execute("SELECT * FROM purchase_return_lines WHERE purchase_return_id=?", (return_id,)).fetchall()
+        if not lines:
+            raise ValueError("purchase return needs lines")
+        total = 0
+        for line in lines:
+            lot = conn.execute(
+                "SELECT l.product_id,u.allows_fraction FROM purchase_lots l "
+                "JOIN purchase_invoice_lines i ON i.id=l.purchase_invoice_line_id "
+                "JOIN products p ON p.id=l.product_id JOIN units u ON u.id=p.base_unit_id "
+                "LEFT JOIN reels r ON r.id=? AND r.lot_id=l.id AND r.status NOT IN ('DAMAGED','RETURNED') "
+                "WHERE l.id=? AND i.id=? AND i.purchase_invoice_id=? "
+                "AND ((l.tracking_mode='LOT' AND ? IS NULL) OR (l.tracking_mode='REEL' AND r.id IS NOT NULL))",
+                (line["reel_id"], line["lot_id"], line["purchase_invoice_line_id"],
+                 ret["purchase_invoice_id"], line["reel_id"]),
+            ).fetchone()
+            if lot is None:
+                raise InventoryError("return stock source does not belong to the original invoice")
+            if not lot["allows_fraction"] and line["quantity_micros"] % 1_000_000:
+                raise ValueError("base unit does not allow fractional quantities")
+            parts = self._consume(conn, line["lot_id"], line["quantity_micros"], line["reel_id"])
+            cost = sum(part["cost"] for part in parts)
+            movement_id = self._create_movement(
+                conn, "PURCHASE_RETURN", lot["product_id"], line["lot_id"], line["reel_id"], line["quantity_micros"], cost, "OUT",
+                "PURCHASE_RETURN", return_id, ret["return_date"], actor_id, line["purchase_invoice_line_id"],
+            )
+            for part in parts:
+                table = "reel_allocations" if line["reel_id"] else "lot_allocations"
+                scope_col = "reel_id" if line["reel_id"] else "lot_id"
+                scope_val = line["reel_id"] if line["reel_id"] else line["lot_id"]
+                conn.execute(
+                    f"INSERT INTO {table}(stock_movement_id,cost_layer_id,{scope_col},purchase_return_line_id,allocation_role,quantity_micros,cost_piastres,direction,layer_position_start_micros,layer_position_end_micros) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (movement_id, part["layer"]["id"], scope_val, line["id"], "PURCHASE_RETURN", part["quantity"], part["cost"], "OUT", part["start"], part["end"]),
+                )
+            conn.execute("UPDATE purchase_return_lines SET cost_piastres=? WHERE id=?", (cost, line["id"]))
+            if line["reel_id"] is not None:
+                refresh_reel_status(conn, line["reel_id"])
+            self._refresh_lot_status(conn, line["lot_id"])
+            total += cost
+        journal = self.accounting.post_journal(
+            ret["return_date"], "PURCHASE_RETURN", return_id,
+            [{"account_code": "2010", "debit": total, "party_type": "SUPPLIER", "party_id": ret["supplier_id"]},
+             {"account_code": "1200", "credit": total}],
+            description=f"مرتجع شراء {ret['document_no']}", posted_by=actor_id, conn=conn,
+        )
+        conn.execute(
+            "UPDATE purchase_returns SET status='POSTED', total_piastres=?, posted_at=?, journal_entry_id=? WHERE id=?",
+            (total, _now(), journal, return_id),
+        )
+        return {"return_id": return_id, "total": total, "journal_id": journal}
 
     def lot_remaining(self, lot_id: int) -> tuple[int, int]:
         with self.db.connect() as conn:

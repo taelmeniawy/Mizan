@@ -69,12 +69,22 @@ class DocumentStore:
             raise DocumentError("rendered document file is missing")
         final_path = self.resolve(relative_path)
         final_path.parent.mkdir(parents=True, exist_ok=True)
-        if final_path.exists():
+        try:
+            if os.name == "nt":
+                os.rename(temp_path, final_path)
+            else:
+                # The staging file is in this managed store, on the same filesystem.
+                os.link(temp_path, final_path)
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    final_path.unlink()
+                    raise
+        except FileExistsError as exc:
             raise DocumentError(
                 f"official document file already exists: {relative_path}; "
                 "refusing to overwrite a historical document"
-            )
-        os.replace(temp_path, final_path)
+            ) from exc
         return final_path
 
     def remove(self, relative_path: str) -> None:

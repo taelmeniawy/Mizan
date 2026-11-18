@@ -1,6 +1,14 @@
 from __future__ import annotations
 
 from .db import Database
+from .pricing import unit_conversion
+
+
+_PRICE_KEYS = {
+    "product_default_prices": ("product_id", "unit_id"),
+    "price_list_items": ("price_list_id", "product_id", "unit_id"),
+    "customer_prices": ("customer_id", "product_id", "unit_id"),
+}
 
 
 class MasterDataService:
@@ -115,14 +123,28 @@ class MasterDataService:
             )
             return int(cur.lastrowid)
 
-    def set_price(self, table: str, **values) -> None:
-        allowed = {"product_default_prices", "price_list_items", "customer_prices"}
-        if table not in allowed:
+    def set_price(self, table: str, *, update_existing: bool = False, **values: int) -> None:
+        keys = _PRICE_KEYS.get(table)
+        if keys is None:
             raise ValueError("unsupported price table")
-        columns = ", ".join(values)
-        placeholders = ", ".join("?" for _ in values)
+        columns = (*keys, "price_micros")
+        if values.keys() != set(columns):
+            raise ValueError("invalid fields for price table")
+        price = values["price_micros"]
+        if type(price) is not int or not 0 <= price <= 2**63 - 1:
+            raise ValueError("price must be a nonnegative SQLite integer")
+        placeholders = ", ".join("?" for _ in columns)
+        sql = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})"
+        if update_existing:
+            sql += f" ON CONFLICT ({', '.join(keys)}) DO UPDATE SET price_micros=excluded.price_micros"
         with self.db.transaction() as conn:
-            conn.execute(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})", tuple(values.values()))
+            product = conn.execute(
+                "SELECT id,base_unit_id FROM products WHERE id=?", (values["product_id"],),
+            ).fetchone()
+            if product is None:
+                raise ValueError("product not found")
+            unit_conversion(conn, product, values["unit_id"])
+            conn.execute(sql, tuple(values[column] for column in columns))
 
     def resolve_price(self, customer_id: int | None, product_id: int, unit_id: int, price_list_id: int | None = None) -> int:
         with self.db.connect() as conn:

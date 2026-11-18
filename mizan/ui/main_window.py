@@ -25,16 +25,31 @@ from .dashboard import DashboardPage
 from .diagnostics import DiagnosticsPage
 from .login import LoginPage
 from .master import MasterDataPage
+from .purchasing import PurchasesPage
+from .quotations import QUOTATION_PERMISSIONS, QuotationsPage
+from .report_catalog import REPORT_PERMISSIONS
+from .reports import ReportsPage
+from .sales import SalesPage
+from .settings import SettingsPage
 
-# key, Arabic label, permission or permissions (any one grants the page)
+# key, Arabic label, permission or permissions (None grants all authenticated users)
 NAV_ITEMS = (
     ("dashboard", "لوحة التشغيل", "view_dashboard"),
     ("master", "البيانات الأساسية", (
         "manage_products", "manage_customers", "manage_suppliers", "manage_projects",
+        "manage_price_lists",
     )),
+    ("purchases", "المشتريات", ("post_purchases", "manage_supplier_payments", "post_purchase_return")),
+    ("sales", "المبيعات", (
+        "create_sales_draft", "post_sales", "cancel_sales_draft", "manage_customer_receipts",
+        "post_sales_return", "view_customer_balance",
+    )),
+    ("quotations", "عروض الأسعار", QUOTATION_PERMISSIONS),
+    ("reports", "التقارير", REPORT_PERMISSIONS),
     ("backup", "النسخ الاحتياطي", "backup_database"),
     ("audit", "سجل التدقيق", "view_audit_log"),
     ("diagnostics", "سلامة البيانات", "backup_database"),
+    ("settings", "الإعدادات", None),
 )
 
 
@@ -87,12 +102,15 @@ class Shell(QWidget):
         self.content = QStackedWidget()
         for key, title, permission in NAV_ITEMS:
             permissions = permission if isinstance(permission, tuple) else (permission,)
-            if not any(context.has_permission(user_id, item) for item in permissions):
+            if permission is not None and not any(context.has_permission(user_id, item) for item in permissions):
                 continue
             page = self._build_page(key)
             self.pages[key] = page
             self.content.addWidget(page)
             self.nav.addItem(title)
+        quotations = self.pages.get("quotations")
+        if isinstance(quotations, QuotationsPage):
+            quotations.open_sale_requested.connect(self._open_quotation_sale)
         self.nav.currentRowChanged.connect(self.content.setCurrentIndex)
         if self.nav.count():
             self.nav.setCurrentRow(0)
@@ -118,15 +136,31 @@ class Shell(QWidget):
                 return DashboardPage(self.context)
             if key == "master":
                 return MasterDataPage(self.context, self.user_id)
+            if key == "purchases":
+                return PurchasesPage(self.context, self.user_id)
+            if key == "sales":
+                return SalesPage(self.context, self.user_id)
+            if key == "quotations":
+                return QuotationsPage(self.context, self.user_id)
+            if key == "reports":
+                return ReportsPage(self.context, self.user_id)
             if key == "backup":
                 return BackupPage(self.context, self.user_id)
             if key == "audit":
                 return AuditPage(self.context, self.user_id)
             if key == "diagnostics":
                 return DiagnosticsPage(self.context)
+            if key == "settings":
+                return SettingsPage(self.context, self.user_id)
         except Exception as exc:  # One broken screen must not take the shell down.
             return self._message_page(f"تعذر فتح الشاشة: {exc}")
         return self._message_page("شاشة غير معروفة.")
+
+    def _open_quotation_sale(self, sale_id: int) -> None:
+        sales = self.pages.get("sales")
+        if isinstance(sales, SalesPage) and sales.can_invoice:
+            self.nav.setCurrentRow(self.content.indexOf(sales))
+            sales.open_invoice(sale_id)
 
     def _message_page(self, text: str) -> QWidget:
         page = QWidget()

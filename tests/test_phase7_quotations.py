@@ -558,7 +558,7 @@ def test_failed_sale_posting_does_not_change_quotation(qs: QuoteShop):
     assert _row(qs, "sales", sale["sales_id"])["status"] == "DRAFT"
 
 
-def test_generated_sale_draft_commercial_fields_are_locked(qs: QuoteShop):
+def test_generated_sale_draft_commercial_fields_are_locked(qs: QuoteShop, qt_app):
     quote = qs.create_quote()
     qs.issue(quote)
     sale = qs.convert(quote)
@@ -584,6 +584,27 @@ def test_generated_sale_draft_commercial_fields_are_locked(qs: QuoteShop):
     row = _row(qs, "sales", sale["sales_id"])
     assert row["payment_type"] == "CREDIT"
     assert row["financial_account_id"] is None
+
+    from mizan.bootstrap import start
+    from mizan.config import AppPaths
+    from mizan.ui.sales import SaleInvoiceDialog
+
+    context = start(AppPaths.at(qs.db.path.parent))
+    dialog = SaleInvoiceDialog(context, qs.shop.manager, invoice_id=sale["sales_id"])
+    try:
+        assert dialog.locked and not dialog.read_only
+        assert not dialog.customer.isEnabled()
+        assert not dialog.project.isEnabled()
+        assert not dialog.price_list.isEnabled()
+        saved_price = dialog.lines[0].price
+        dialog.payment.setCurrentIndex(dialog.payment.findData("CASH"))
+        dialog.account.setCurrentIndex(dialog.account.findData(qs.shop.cash))
+        assert dialog.save()
+        assert _scalar(qs, "SELECT financial_account_id FROM sales WHERE id=?", (sale["sales_id"],)) == qs.shop.cash
+        assert _scalar(qs, "SELECT unit_price_micros FROM sales_lines WHERE sales_id=?", (sale["sales_id"],)) == saved_price
+    finally:
+        dialog.deleteLater()
+        qt_app.processEvents()
 
 
 # ---------------------------------------------------------------------------

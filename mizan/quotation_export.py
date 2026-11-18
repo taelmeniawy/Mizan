@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from .auth import PermissionService
 from .db import Database
 from .document_store import DocumentStore, sha256_file
 from .documents import DocumentService
@@ -49,6 +50,7 @@ class QuotationExportService:
             raise QuotationExportError(
                 "an authorized user is required to issue an official document"
             )
+        PermissionService(self.db).require(actor_id, "issue_quotation")
         try:
             current = self.quotes.get_quotation(quotation_id)
             if current["status"] != "DRAFT":

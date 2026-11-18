@@ -1,9 +1,7 @@
 """Quotation lifecycle, revisions, conversion, and document snapshots.
 
-Everything in this module is renderer-independent.  Issuing a quotation still
-requires a registered official PDF export; no A4/PDF renderer is selected in
-ADR-0004, so the production path cannot issue a quotation until that decision
-and the A4/PDF/printer acceptance gate are resolved.
+The lifecycle is renderer-independent. Issuance requires an official PDF
+registered by the approved A4 export workflow.
 """
 
 from __future__ import annotations
@@ -418,7 +416,7 @@ class QuotationService:
             _audit(conn, "QUOTATION_CREATED", quotation_id, actor_id)
             return quotation_id
 
-    def update_draft(self, quotation_id: int, lines: list[dict], *,
+    def update_draft(self, quotation_id: int, lines: list[dict] | None, *,
                      customer_id: int | None = None,
                      project_id=_UNSET,
                      price_list_id=_UNSET,
@@ -428,7 +426,8 @@ class QuotationService:
                      notes=_UNSET,
                      terms=_UNSET,
                      actor_id: int | None = None) -> None:
-        if not lines:
+        """Update a draft. Pass no replacement lines to edit dates and text only."""
+        if lines is not None and not lines:
             raise QuotationError("quotation needs lines")
         self._require(actor_id, "create_quotation")
         with self.db.transaction() as conn:
@@ -460,16 +459,22 @@ class QuotationService:
             )
             new_notes = row["notes"] if notes is _UNSET else notes
             new_terms = row["terms"] if terms is _UNSET else terms
+            if lines is None and (
+                new_customer_id != row["customer_id"] or new_project_id != row["project_id"]
+                or new_price_list_id != row["price_list_id"] or new_discount != row["invoice_discount_piastres"]
+            ):
+                raise QuotationError("commercial changes require replacement lines")
             conn.execute(
                 "UPDATE quotations SET customer_id=?,project_id=?,price_list_id=?,"
                 "issue_date=?,valid_until=?,notes=?,terms=? WHERE id=?",
                 (new_customer_id, new_project_id, new_price_list_id, new_issue_date,
                  new_valid_until, new_notes, new_terms, quotation_id),
             )
-            self._replace_lines(
-                conn, quotation_id, new_customer_id, lines, new_price_list_id,
-                new_project_id, new_discount, actor_id,
-            )
+            if lines is not None:
+                self._replace_lines(
+                    conn, quotation_id, new_customer_id, lines, new_price_list_id,
+                    new_project_id, new_discount, actor_id,
+                )
             _audit(conn, "QUOTATION_DRAFT_UPDATED", quotation_id, actor_id)
 
     # ------------------------------------------------------------------

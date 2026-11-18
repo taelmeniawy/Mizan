@@ -1,6 +1,8 @@
 """Phase 10 — application bootstrap, data paths and first run."""
 
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
@@ -99,3 +101,35 @@ def test_startup_report_flags_a_missing_document(tmp_path):
     assert report["documents"]["missing"] == [{"relative_path": "reports/summary.pdf"}]
     assert not pdf.exists()  # The startup check never regenerates a document.
     assert Path(context.paths.db_path).is_file()
+
+
+def test_first_run_rolls_back_failed_cash_setup_and_only_creates_one_owner(tmp_path, monkeypatch):
+    context = start(AppPaths.at(tmp_path / "app"))
+
+    def fail_cash(*args):
+        raise ValueError("account setup failed")
+
+    fields = {"store_name": "متجر", "display_name": "المالك", "password": "owner-pass-1"}
+    with monkeypatch.context() as patched:
+        patched.setattr(context.accounting, "_create_financial_account", fail_cash)
+        with pytest.raises(ValueError, match="account setup failed"):
+            initialize_first_run(context, username="owner", cash_account_name="صندوق", **fields)
+    assert context.user_count() == 0
+    assert context.db.scalar("SELECT COUNT(*) FROM store_profile") == 0
+    assert context.db.scalar("SELECT COUNT(*) FROM audit_events") == 0
+
+    barrier = Barrier(2)
+
+    def initialize(username):
+        barrier.wait(timeout=10)
+        try:
+            return initialize_first_run(context, username=username, cash_account_name="صندوق", **fields)
+        except BootstrapError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(initialize, ("owner-a", "owner-b")))
+    assert len([value for value in outcomes if value is not None]) == 1
+    assert context.user_count() == 1
+    assert context.db.scalar("SELECT COUNT(*) FROM audit_events WHERE event_type='STORE_INITIALIZED'") == 1
+    assert context.db.scalar("SELECT COUNT(*) FROM financial_accounts WHERE code='CASH'") == 1

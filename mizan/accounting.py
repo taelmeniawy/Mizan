@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import closing, nullcontext
 from datetime import date, datetime, timezone
 
+from .auth import AuthService, PermissionService
 from .db import Database
 from .numbering import next_number
 from .periods import require_open_period
@@ -330,16 +331,27 @@ class AccountingService:
             "matched": difference == 0,
         }
 
-    def create_financial_account(self, code: str, name_ar: str, account_type: str, gl_code: str) -> int:
+    def create_financial_account(self, code: str, name_ar: str, account_type: str, gl_code: str,
+                                 *, actor_id: int | None = None) -> int:
         with self.db.transaction() as conn:
-            gl = conn.execute("SELECT id FROM accounts WHERE code=?", (gl_code,)).fetchone()
-            if gl is None:
-                raise ValueError("GL account not found")
-            cur = conn.execute(
-                "INSERT INTO financial_accounts(code,name_ar,account_type,gl_account_id) VALUES(?,?,?,?)",
-                (code, name_ar, account_type, gl["id"]),
-            )
-            return int(cur.lastrowid)
+            if actor_id is not None:
+                PermissionService(self.db).require(actor_id, "manage_settings")
+            account_id = self._create_financial_account(conn, code, name_ar, account_type, gl_code)
+            if actor_id is not None:
+                AuthService._audit(conn, "FINANCIAL_ACCOUNT_CREATED", "financial_account", account_id, actor_id,
+                                   after={"code": code, "name_ar": name_ar, "account_type": account_type})
+            return account_id
+
+    @staticmethod
+    def _create_financial_account(conn, code: str, name_ar: str, account_type: str, gl_code: str) -> int:
+        gl = conn.execute("SELECT id FROM accounts WHERE code=?", (gl_code,)).fetchone()
+        if gl is None:
+            raise ValueError("GL account not found")
+        cur = conn.execute(
+            "INSERT INTO financial_accounts(code,name_ar,account_type,gl_account_id) VALUES(?,?,?,?)",
+            (code, name_ar, account_type, gl["id"]),
+        )
+        return int(cur.lastrowid)
 
     def transfer(self, financial_account_id: int, to_gl_code: str, amount: int, entry_date: str, actor_id: int | None = None) -> int:
         if amount <= 0:

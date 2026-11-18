@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from contextlib import closing
+from datetime import date, datetime, timezone
 
 from .accounting import AccountingService
 from .auth import PermissionDenied, PermissionService
@@ -30,6 +31,10 @@ class SalesError(ValueError):
     pass
 
 
+class BelowCostApprovalRequired(SalesError):
+    pass
+
+
 class InsufficientStock(SalesError):
     def __init__(self, shortages: list[dict]):
         self.shortages = shortages
@@ -55,11 +60,11 @@ class SalesService:
             PermissionService(self.db).require(actor_id, permission)
 
     @staticmethod
-    def _product(conn, product_id: int):
+    def _product(conn, product_id: int, *, require_active: bool = True):
         row = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
         if row is None:
             raise SalesError("product not found")
-        if not row["is_active"]:
+        if require_active and not row["is_active"]:
             raise SalesError("product is inactive")
         return row
 
@@ -177,6 +182,7 @@ class SalesService:
                      price_list_id: int | None = None, project_id=_UNSET,
                      invoice_discount_piastres: int | None = None,
                      due_date=_UNSET, financial_account_id=_UNSET,
+                     invoice_date: str | None = None, clear_price_list: bool = False,
                      actor_id: int | None = None) -> None:
         if not lines:
             raise SalesError("invoice needs lines")
@@ -198,6 +204,8 @@ class SalesService:
             if new_payment_type not in {"CASH", "CREDIT"}:
                 raise SalesError("payment type MIXED is deferred under OQ-SAL-003")
             new_price_list_id = price_list_id if price_list_id is not None else invoice["price_list_id"]
+            if clear_price_list:
+                new_price_list_id = None
             if new_price_list_id is not None:
                 self._price_list(conn, new_price_list_id)
             new_project_id = invoice["project_id"] if project_id is _UNSET else project_id
@@ -220,9 +228,9 @@ class SalesService:
                 raise SalesError("invoice discount cannot be negative")
             conn.execute(
                 "UPDATE sales SET sale_type=?,payment_type=?,price_list_id=?,project_id=?,"
-                "financial_account_id=?,due_date=? WHERE id=?",
+                "financial_account_id=?,due_date=?,invoice_date=? WHERE id=?",
                 (new_sale_type, new_payment_type, new_price_list_id, new_project_id,
-                 new_financial_account_id, new_due_date, invoice_id),
+                 new_financial_account_id, new_due_date, invoice_date or invoice["invoice_date"], invoice_id),
             )
             self._replace_lines(conn, invoice_id, customer["id"], lines, new_price_list_id,
                                 new_project_id, new_invoice_discount, actor_id)
@@ -451,7 +459,7 @@ class SalesService:
                 if actor_id is None or not PermissionService(self.db).has(actor_id, "approve_below_cost"):
                     raise PermissionDenied("missing permission: approve_below_cost")
                 if not reason:
-                    raise SalesError("below-cost sale requires a recorded reason")
+                    raise BelowCostApprovalRequired("below-cost sale requires a recorded reason")
             else:
                 reason = None
 
@@ -866,112 +874,159 @@ class SalesService:
                 })
         return result
 
+    def receipt_candidates(self, customer_id: int, receipt_date: str) -> list[dict]:
+        """Invoice balances available for a receipt on the given date."""
+        with closing(self.db.connect()) as conn:
+            conn.execute("BEGIN")
+            candidates = []
+            for invoice in conn.execute(
+                "SELECT * FROM sales WHERE customer_id=? AND status='POSTED' "
+                "AND reversal_journal_entry_id IS NULL AND payment_type!='CASH' "
+                "AND substr(invoice_date,1,10)<=? ORDER BY invoice_date,id", (customer_id, receipt_date),
+            ):
+                balance = self._invoice_balance(conn, invoice)
+                if balance:
+                    candidates.append({
+                        "sales_id": invoice["id"], "document_no": invoice["document_no"],
+                        "invoice_date": invoice["invoice_date"], "outstanding": balance,
+                    })
+            return candidates
+
+    def record_customer_receipt(self, customer_id: int, financial_account_id: int, amount_piastres: int,
+                                receipt_date: str, allocations: list[dict], *,
+                                notes: str | None = None, actor_id: int) -> dict:
+        """Create and post a receipt in one transaction."""
+        if date.fromisoformat(receipt_date).isoformat() != receipt_date:
+            raise SalesError("receipt date must be a YYYY-MM-DD date")
+        with self.db.transaction() as conn:
+            receipt_id = self._create_receipt(
+                conn, customer_id, financial_account_id, amount_piastres, receipt_date, allocations, notes, actor_id,
+            )
+            result = self._post_receipt(conn, receipt_id, actor_id)
+            return result | {"document_no": conn.execute(
+                "SELECT document_no FROM customer_receipts WHERE id=?", (receipt_id,),
+            ).fetchone()[0]}
+
     def create_receipt(self, customer_id: int, financial_account_id: int, amount_piastres: int,
                        receipt_date: str, allocations: list[dict] | None = None,
                        notes: str | None = None, actor_id: int | None = None) -> int:
+        with self.db.transaction() as conn:
+            return self._create_receipt(
+                conn, customer_id, financial_account_id, amount_piastres, receipt_date,
+                allocations, notes, actor_id,
+            )
+
+    def _create_receipt(self, conn, customer_id, financial_account_id, amount_piastres,
+                        receipt_date, allocations, notes, actor_id):
         if amount_piastres <= 0:
             raise SalesError("receipt amount must be positive")
         self._require(actor_id, "manage_customer_receipts")
         allocations = allocations or []
-        with self.db.transaction() as conn:
-            self._customer(conn, customer_id)
-            self._financial_account(conn, financial_account_id)
-            total = 0
-            seen: set[int] = set()
-            for allocation in allocations:
-                sales_id = int(allocation["sales_id"])
-                amount = int(allocation["amount_piastres"])
-                if amount <= 0:
-                    raise SalesError("receipt allocation must be positive")
-                if sales_id in seen:
-                    raise SalesError("duplicate invoice allocation in receipt")
-                seen.add(sales_id)
-                invoice = conn.execute("SELECT * FROM sales WHERE id=?", (sales_id,)).fetchone()
-                if invoice is None or invoice["status"] != "POSTED":
-                    raise SalesError("posted sales invoice not found")
-                if invoice["customer_id"] != customer_id:
-                    raise SalesError("invoice does not belong to the receipt customer")
-                if invoice["reversal_journal_entry_id"] is not None:
-                    raise SalesError("cannot allocate a receipt to a reversed invoice")
-                outstanding = self._invoice_balance(conn, invoice)
-                if amount > outstanding:
-                    raise SalesError("receipt allocation exceeds the invoice outstanding balance")
-                total += amount
-            if total > amount_piastres:
-                raise SalesError("receipt allocations exceed the receipt amount")
-            document_no = next_number(conn, "CUSTOMER_RECEIPT", int(receipt_date[:4]), "CR-")
-            cur = conn.execute(
-                "INSERT INTO customer_receipts(document_no,customer_id,financial_account_id,"
-                "amount_piastres,receipt_date,notes,created_by) VALUES(?,?,?,?,?,?,?)",
-                (document_no, customer_id, financial_account_id, amount_piastres,
-                 receipt_date, notes, actor_id),
+        self._customer(conn, customer_id)
+        self._financial_account(conn, financial_account_id)
+        total = 0
+        seen: set[int] = set()
+        for allocation in allocations:
+            sales_id = int(allocation["sales_id"])
+            amount = int(allocation["amount_piastres"])
+            if amount <= 0:
+                raise SalesError("receipt allocation must be positive")
+            if sales_id in seen:
+                raise SalesError("duplicate invoice allocation in receipt")
+            seen.add(sales_id)
+            invoice = conn.execute("SELECT * FROM sales WHERE id=?", (sales_id,)).fetchone()
+            if invoice is None or invoice["status"] != "POSTED":
+                raise SalesError("posted sales invoice not found")
+            if invoice["customer_id"] != customer_id:
+                raise SalesError("invoice does not belong to the receipt customer")
+            if invoice["reversal_journal_entry_id"] is not None:
+                raise SalesError("cannot allocate a receipt to a reversed invoice")
+            if invoice["invoice_date"][:10] > receipt_date[:10]:
+                raise SalesError("receipt date is before the sales invoice")
+            outstanding = self._invoice_balance(conn, invoice)
+            if amount > outstanding:
+                raise SalesError("receipt allocation exceeds the invoice outstanding balance")
+            total += amount
+        if total > amount_piastres:
+            raise SalesError("receipt allocations exceed the receipt amount")
+        document_no = next_number(conn, "CUSTOMER_RECEIPT", int(receipt_date[:4]), "CR-")
+        cur = conn.execute(
+            "INSERT INTO customer_receipts(document_no,customer_id,financial_account_id,"
+            "amount_piastres,receipt_date,notes,created_by) VALUES(?,?,?,?,?,?,?)",
+            (document_no, customer_id, financial_account_id, amount_piastres,
+             receipt_date, notes, actor_id),
+        )
+        receipt_id = int(cur.lastrowid)
+        for allocation in allocations:
+            conn.execute(
+                "INSERT INTO customer_receipt_allocations(receipt_id,sales_id,amount_piastres) "
+                "VALUES(?,?,?)",
+                (receipt_id, int(allocation["sales_id"]), int(allocation["amount_piastres"])),
             )
-            receipt_id = int(cur.lastrowid)
-            for allocation in allocations:
-                conn.execute(
-                    "INSERT INTO customer_receipt_allocations(receipt_id,sales_id,amount_piastres) "
-                    "VALUES(?,?,?)",
-                    (receipt_id, int(allocation["sales_id"]), int(allocation["amount_piastres"])),
-                )
-            return receipt_id
+        return receipt_id
 
     def post_receipt(self, receipt_id: int, actor_id: int | None = None) -> dict:
         self._require(actor_id, "manage_customer_receipts")
         with self.db.transaction() as conn:
-            receipt = conn.execute(
-                "SELECT * FROM customer_receipts WHERE id=?", (receipt_id,)
+            return self._post_receipt(conn, receipt_id, actor_id)
+
+    def _post_receipt(self, conn, receipt_id, actor_id):
+        receipt = conn.execute(
+            "SELECT * FROM customer_receipts WHERE id=?", (receipt_id,)
+        ).fetchone()
+        if receipt is None or receipt["status"] != "DRAFT":
+            raise SalesError("draft customer receipt not found")
+        self._customer(conn, receipt["customer_id"])
+        allocations = conn.execute(
+            "SELECT * FROM customer_receipt_allocations WHERE receipt_id=?", (receipt_id,)
+        ).fetchall()
+        allocated = 0
+        for allocation in allocations:
+            invoice = conn.execute(
+                "SELECT * FROM sales WHERE id=?", (allocation["sales_id"],)
             ).fetchone()
-            if receipt is None or receipt["status"] != "DRAFT":
-                raise SalesError("draft customer receipt not found")
-            self._customer(conn, receipt["customer_id"])
-            allocations = conn.execute(
-                "SELECT * FROM customer_receipt_allocations WHERE receipt_id=?", (receipt_id,)
-            ).fetchall()
-            allocated = 0
-            for allocation in allocations:
-                invoice = conn.execute(
-                    "SELECT * FROM sales WHERE id=?", (allocation["sales_id"],)
-                ).fetchone()
-                if invoice is None or invoice["status"] != "POSTED":
-                    raise SalesError("posted sales invoice not found")
-                if invoice["customer_id"] != receipt["customer_id"]:
-                    raise SalesError("invoice does not belong to the receipt customer")
-                outstanding = self._invoice_balance(conn, invoice)
-                if allocation["amount_piastres"] > outstanding:
-                    raise SalesError("receipt allocation exceeds the invoice outstanding balance")
-                allocated += allocation["amount_piastres"]
-            if allocated > receipt["amount_piastres"]:
-                raise SalesError("receipt allocations exceed the receipt amount")
-            excess = receipt["amount_piastres"] - allocated
-            account = self._financial_account(conn, receipt["financial_account_id"])
-            lines = [{"account_code": account["gl_code"], "debit": receipt["amount_piastres"]}]
-            if allocated:
-                lines.append({"account_code": "1100", "credit": allocated,
-                              "party_type": "CUSTOMER", "party_id": receipt["customer_id"]})
-            if excess:
-                lines.append({"account_code": "2020", "credit": excess,
-                              "party_type": "CUSTOMER", "party_id": receipt["customer_id"]})
-            journal_id = self.accounting.post_journal(
-                receipt["receipt_date"], "CUSTOMER_RECEIPT", receipt_id, lines,
-                description=f"تحصيل عميل {receipt['document_no']}",
-                posted_by=actor_id, conn=conn,
-            )
-            if excess:
-                conn.execute(
-                    "INSERT INTO customer_credits(customer_id,source_type,source_id,amount_piastres,"
-                    "remaining_piastres,status) VALUES(?,?,?,?,?,?)",
-                    (receipt["customer_id"], "OVERPAYMENT", receipt_id, excess, excess, "OPEN"),
-                )
+            if invoice is None or invoice["status"] != "POSTED":
+                raise SalesError("posted sales invoice not found")
+            if invoice["customer_id"] != receipt["customer_id"]:
+                raise SalesError("invoice does not belong to the receipt customer")
+            if invoice["invoice_date"][:10] > receipt["receipt_date"][:10]:
+                raise SalesError("receipt date is before the sales invoice")
+            outstanding = self._invoice_balance(conn, invoice)
+            if allocation["amount_piastres"] > outstanding:
+                raise SalesError("receipt allocation exceeds the invoice outstanding balance")
+            allocated += allocation["amount_piastres"]
+        if allocated > receipt["amount_piastres"]:
+            raise SalesError("receipt allocations exceed the receipt amount")
+        excess = receipt["amount_piastres"] - allocated
+        account = self._financial_account(conn, receipt["financial_account_id"])
+        lines = [{"account_code": account["gl_code"], "debit": receipt["amount_piastres"]}]
+        if allocated:
+            lines.append({"account_code": "1100", "credit": allocated,
+                          "party_type": "CUSTOMER", "party_id": receipt["customer_id"]})
+        if excess:
+            lines.append({"account_code": "2020", "credit": excess,
+                          "party_type": "CUSTOMER", "party_id": receipt["customer_id"]})
+        journal_id = self.accounting.post_journal(
+            receipt["receipt_date"], "CUSTOMER_RECEIPT", receipt_id, lines,
+            description=f"تحصيل عميل {receipt['document_no']}",
+            posted_by=actor_id, conn=conn,
+        )
+        if excess:
             conn.execute(
-                "UPDATE customer_receipts SET status='POSTED',posted_at=?,journal_entry_id=? WHERE id=?",
-                (_now(), journal_id, receipt_id),
+                "INSERT INTO customer_credits(customer_id,source_type,source_id,amount_piastres,"
+                "remaining_piastres,status) VALUES(?,?,?,?,?,?)",
+                (receipt["customer_id"], "OVERPAYMENT", receipt_id, excess, excess, "OPEN"),
             )
-            return {
-                "receipt_id": receipt_id,
-                "journal_id": journal_id,
-                "allocated": allocated,
-                "customer_credit": excess,
-            }
+        conn.execute(
+            "UPDATE customer_receipts SET status='POSTED',posted_at=?,journal_entry_id=? WHERE id=?",
+            (_now(), journal_id, receipt_id),
+        )
+        return {
+            "receipt_id": receipt_id,
+            "journal_id": journal_id,
+            "allocated": allocated,
+            "customer_credit": excess,
+        }
 
     def apply_customer_credit(self, credit_id: int, sales_id: int, amount_piastres: int,
                               actor_id: int | None = None,
@@ -993,6 +1048,16 @@ class SalesService:
                 raise SalesError("posted sales invoice not found")
             if invoice["customer_id"] != credit["customer_id"]:
                 raise SalesError("invoice does not belong to the credit customer")
+            if journal_date < invoice["invoice_date"][:10]:
+                raise SalesError("credit application date is before the sales invoice")
+            if credit["source_type"] == "OVERPAYMENT":
+                source = conn.execute("SELECT receipt_date FROM customer_receipts WHERE id=?", (credit["source_id"],)).fetchone()
+            elif credit["source_type"] == "SALES_RETURN":
+                source = conn.execute("SELECT return_date FROM sales_returns WHERE id=?", (credit["source_id"],)).fetchone()
+            else:
+                source = None
+            if source is not None and journal_date < source[0][:10]:
+                raise SalesError("credit application date is before the source credit")
             if amount_piastres > self._invoice_balance(conn, invoice):
                 raise SalesError("credit application exceeds the invoice outstanding balance")
             cur = conn.execute(
@@ -1041,8 +1106,7 @@ class SalesService:
         ).fetchone()[0])
 
     def _returnable_for_line(self, conn, sales_line, include_zero: bool = False) -> list[dict]:
-        product = self._product(conn, sales_line["product_id"])
-        if product["tracking_mode"] == "LOT":
+        if sales_line["tracking_mode"] == "LOT":
             rows = conn.execute(
                 "SELECT la.id,la.lot_id,la.quantity_micros,la.cost_piastres "
                 "FROM lot_allocations la WHERE la.allocation_role='SALE_ISSUE' "
@@ -1123,17 +1187,72 @@ class SalesService:
             if method in {"CASH_REFUND", "BANK_REFUND", "MIXED"}:
                 raise SalesError("cash/bank/mixed settlement requires a refund amount")
 
+    def record_sales_return(self, invoice_id: int, lines: list[dict], return_date: str, reason: str,
+                            *, settlement_method: str = "REDUCE_RECEIVABLE",
+                            financial_account_id: int | None = None, refund_piastres: int = 0,
+                            refund_reference: str | None = None, actor_id: int) -> dict:
+        """Create and post a return in one transaction, including its stock and journal."""
+        if date.fromisoformat(return_date).isoformat() != return_date:
+            raise SalesError("return date must be a YYYY-MM-DD date")
+        with self.db.transaction() as conn:
+            return_id = self._create_return(
+                conn, invoice_id, lines, return_date, reason, settlement_method,
+                financial_account_id, refund_piastres, refund_reference, actor_id,
+            )
+            result = self._post_return(conn, return_id, actor_id)
+            return result | {"document_no": conn.execute(
+                "SELECT document_no FROM sales_returns WHERE id=?", (return_id,),
+            ).fetchone()[0]}
+
+    def sales_return_sources(self, invoice_id: int) -> list[dict]:
+        """Return available original issue quantities, in base units."""
+        with closing(self.db.connect()) as conn:
+            conn.execute("BEGIN")
+            result = []
+            for line in conn.execute(
+                "SELECT l.*,p.name_ar AS product,u.name_ar AS base_unit FROM sales_lines l "
+                "JOIN products p ON p.id=l.product_id JOIN units u ON u.id=p.base_unit_id "
+                "WHERE l.sales_id=? ORDER BY l.line_no", (invoice_id,),
+            ):
+                allocations = self._returnable_for_line(conn, line)
+                already_returned = self._posted_returned_sold_qty(conn, line["id"]) if allocations else 0
+                for allocation in allocations:
+                    if allocation["reel_id"] is None:
+                        source = conn.execute(
+                            "SELECT lot_no FROM purchase_lots WHERE id=?", (allocation["lot_id"],),
+                        ).fetchone()[0]
+                    else:
+                        source = conn.execute(
+                            "SELECT reel_no FROM reels WHERE id=?", (allocation["reel_id"],),
+                        ).fetchone()[0]
+                    result.append({
+                        "line_id": line["id"], "line_no": line["line_no"], "product": line["product"],
+                        "base_unit": line["base_unit"], "source": source, "kind": allocation["kind"],
+                        "allocation_id": allocation["allocation_id"], "remaining": allocation["remaining_qty_micros"],
+                        "conversion_num": line["conversion_num"], "conversion_den": line["conversion_den"],
+                        "sold_quantity": line["quantity_micros"], "previous_returns": already_returned,
+                        "net_piastres": line["net_piastres"],
+                    })
+            return result
+
     def create_return(self, invoice_id: int, lines: list[dict], return_date: str, reason: str,
                       settlement_method: str = "REDUCE_RECEIVABLE",
                       financial_account_id: int | None = None,
                       refund_piastres: int = 0, refund_reference: str | None = None,
                       actor_id: int | None = None) -> int:
+        with self.db.transaction() as conn:
+            return self._create_return(
+                conn, invoice_id, lines, return_date, reason,
+                settlement_method, financial_account_id, refund_piastres, refund_reference, actor_id,
+            )
+
+    def _create_return(self, conn, invoice_id, lines, return_date, reason,
+                       method, financial_account_id, refund_piastres, refund_reference, actor_id):
         if not lines:
             raise SalesError("sales return needs lines")
         if not reason or not reason.strip():
             raise SalesError("sales return reason is required")
         self._require(actor_id, "post_sales_return")
-        method = settlement_method
         if method not in {"REDUCE_RECEIVABLE", "CUSTOMER_CREDIT", "CASH_REFUND", "BANK_REFUND", "MIXED"}:
             raise SalesError("invalid settlement method")
         if refund_piastres < 0:
@@ -1150,81 +1269,91 @@ class SalesService:
             PermissionService(self.db).require(actor_id, "issue_customer_refund")
         elif method in {"CASH_REFUND", "BANK_REFUND", "MIXED"}:
             raise SalesError("cash/bank/mixed settlement requires a refund amount")
-        with self.db.transaction() as conn:
-            invoice = conn.execute("SELECT * FROM sales WHERE id=?", (invoice_id,)).fetchone()
-            if invoice is None or invoice["status"] != "POSTED":
-                raise SalesError("posted sales invoice not found")
-            if invoice["reversal_journal_entry_id"] is not None:
-                raise SalesError("cannot return a reversed sales invoice")
-            self._customer(conn, invoice["customer_id"])
-            if financial_account_id is not None:
-                self._financial_account(conn, financial_account_id)
-            any_damaged = any(str(line.get("condition", "SELLABLE")).upper() == "DAMAGED" for line in lines)
-            document_no = next_number(conn, "SALES_RETURN", int(return_date[:4]), "SR-")
-            cur = conn.execute(
-                "INSERT INTO sales_returns(document_no,sales_id,customer_id,return_date,"
-                "settlement_method,financial_account_id,refund_piastres,refund_reference,"
-                "damaged_cost_accounting,reason,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (document_no, invoice_id, invoice["customer_id"], return_date, method,
-                 financial_account_id, refund_piastres, refund_reference,
-                 "PENDING" if any_damaged else "NOT_APPLICABLE",
-                 reason.strip(), actor_id),
+        invoice = conn.execute("SELECT * FROM sales WHERE id=?", (invoice_id,)).fetchone()
+        if invoice is None or invoice["status"] != "POSTED":
+            raise SalesError("posted sales invoice not found")
+        if invoice["reversal_journal_entry_id"] is not None:
+            raise SalesError("cannot return a reversed sales invoice")
+        if invoice["invoice_date"][:10] > return_date[:10]:
+            raise SalesError("return date is before the sales invoice")
+        self._customer(conn, invoice["customer_id"])
+        if financial_account_id is not None:
+            self._financial_account(conn, financial_account_id)
+        any_damaged = any(str(line.get("condition", "SELLABLE")).upper() == "DAMAGED" for line in lines)
+        document_no = next_number(conn, "SALES_RETURN", int(return_date[:4]), "SR-")
+        cur = conn.execute(
+            "INSERT INTO sales_returns(document_no,sales_id,customer_id,return_date,"
+            "settlement_method,financial_account_id,refund_piastres,refund_reference,"
+            "damaged_cost_accounting,reason,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (document_no, invoice_id, invoice["customer_id"], return_date, method,
+             financial_account_id, refund_piastres, refund_reference,
+             "PENDING" if any_damaged else "NOT_APPLICABLE",
+             reason.strip(), actor_id),
+        )
+        return_id = int(cur.lastrowid)
+        pending_sold: dict[int, int] = {}
+        pending_alloc: dict[tuple[str, int], int] = {}
+        for index, line in enumerate(lines, start=1):
+            sales_line = conn.execute(
+                "SELECT * FROM sales_lines WHERE id=?", (line["sales_line_id"],)
+            ).fetchone()
+            if sales_line is None or sales_line["sales_id"] != invoice_id:
+                raise SalesError("sales line does not belong to the invoice")
+            product = self._product(conn, sales_line["product_id"], require_active=False)
+            quantity = int(line["quantity_micros"])
+            if quantity <= 0:
+                raise SalesError("quantity must be positive")
+            base_qty, remainder = divmod(
+                quantity * sales_line["conversion_num"], sales_line["conversion_den"],
             )
-            return_id = int(cur.lastrowid)
-            pending_sold: dict[int, int] = {}
-            pending_alloc: dict[tuple[str, int], int] = {}
-            for index, line in enumerate(lines, start=1):
-                sales_line = conn.execute(
-                    "SELECT * FROM sales_lines WHERE id=?", (line["sales_line_id"],)
-                ).fetchone()
-                if sales_line is None or sales_line["sales_id"] != invoice_id:
-                    raise SalesError("sales line does not belong to the invoice")
-                product = self._product(conn, sales_line["product_id"])
-                quantity = int(line["quantity_micros"])
-                base_qty, _, _ = self._base_qty(
-                    conn, product, sales_line["unit_id"], quantity
+            if remainder:
+                raise SalesError("conversion does not produce an integer base quantity")
+            allows_fraction = conn.execute(
+                "SELECT allows_fraction FROM units WHERE id=?", (product["base_unit_id"],),
+            ).fetchone()[0]
+            if not allows_fraction and base_qty % 1_000_000:
+                raise SalesError("base unit does not allow fractional quantities")
+            already = self._posted_returned_sold_qty(conn, sales_line["id"])
+            pending = pending_sold.get(sales_line["id"], 0)
+            if already + pending + quantity > sales_line["quantity_micros"]:
+                raise SalesError("return quantity exceeds the remaining sold quantity")
+            returnable = self._returnable_for_line(conn, sales_line)
+            selections = line.get("allocation_selections")
+            if selections is not None:
+                if not selections:
+                    raise SalesError("allocation selection cannot be empty")
+                selection_rows = self._resolve_selections(
+                    selections, returnable, base_qty, pending_alloc,
                 )
-                already = self._posted_returned_sold_qty(conn, sales_line["id"])
-                pending = pending_sold.get(sales_line["id"], 0)
-                if already + pending + quantity > sales_line["quantity_micros"]:
-                    raise SalesError("return quantity exceeds the remaining sold quantity")
-                returnable = self._returnable_for_line(conn, sales_line)
-                selections = line.get("allocation_selections")
-                if selections is not None:
-                    if not selections:
-                        raise SalesError("allocation selection cannot be empty")
-                    selection_rows = self._resolve_selections(
-                        selections, returnable, base_qty, pending_alloc,
-                    )
-                else:
-                    selection_rows = self._default_selections(returnable, base_qty, pending_alloc)
-                if sum(row["quantity_micros"] for row in selection_rows) != base_qty:
-                    raise SalesError("allocation selections must cover the returned base quantity")
-                for row in selection_rows:
-                    key = (row["kind"], row["allocation_id"])
-                    pending_alloc[key] = pending_alloc.get(key, 0) + row["quantity_micros"]
-                pending_sold[sales_line["id"]] = pending + quantity
-                lots = {row["lot_id"] for row in selection_rows}
-                reels = {row["reel_id"] for row in selection_rows if row["kind"] == "REEL"}
-                condition = str(line.get("condition", "SELLABLE")).upper()
-                if condition not in {"SELLABLE", "DAMAGED"}:
-                    raise SalesError("return condition must be SELLABLE or DAMAGED")
-                cur = conn.execute(
-                    "INSERT INTO sales_return_lines(sales_return_id,line_no,sales_line_id,"
-                    "quantity_micros,base_qty_micros,condition,lot_id,reel_id) "
-                    "VALUES(?,?,?,?,?,?,?,?)",
-                    (return_id, index, sales_line["id"], quantity, base_qty, condition,
-                     next(iter(lots)) if len(lots) == 1 else None,
-                     next(iter(reels)) if len(reels) == 1 else None),
+            else:
+                selection_rows = self._default_selections(returnable, base_qty, pending_alloc)
+            if sum(row["quantity_micros"] for row in selection_rows) != base_qty:
+                raise SalesError("allocation selections must cover the returned base quantity")
+            for row in selection_rows:
+                key = (row["kind"], row["allocation_id"])
+                pending_alloc[key] = pending_alloc.get(key, 0) + row["quantity_micros"]
+            pending_sold[sales_line["id"]] = pending + quantity
+            lots = {row["lot_id"] for row in selection_rows}
+            reels = {row["reel_id"] for row in selection_rows if row["kind"] == "REEL"}
+            condition = str(line.get("condition", "SELLABLE")).upper()
+            if condition not in {"SELLABLE", "DAMAGED"}:
+                raise SalesError("return condition must be SELLABLE or DAMAGED")
+            cur = conn.execute(
+                "INSERT INTO sales_return_lines(sales_return_id,line_no,sales_line_id,"
+                "quantity_micros,base_qty_micros,condition,lot_id,reel_id) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (return_id, index, sales_line["id"], quantity, base_qty, condition,
+                 next(iter(lots)) if len(lots) == 1 else None,
+                 next(iter(reels)) if len(reels) == 1 else None),
+            )
+            return_line_id = int(cur.lastrowid)
+            for row in selection_rows:
+                conn.execute(
+                    "INSERT INTO sales_return_line_allocations(sales_return_line_id,allocation_kind,"
+                    "original_allocation_id,quantity_micros) VALUES(?,?,?,?)",
+                    (return_line_id, row["kind"], row["allocation_id"], row["quantity_micros"]),
                 )
-                return_line_id = int(cur.lastrowid)
-                for row in selection_rows:
-                    conn.execute(
-                        "INSERT INTO sales_return_line_allocations(sales_return_line_id,allocation_kind,"
-                        "original_allocation_id,quantity_micros) VALUES(?,?,?,?)",
-                        (return_line_id, row["kind"], row["allocation_id"], row["quantity_micros"]),
-                    )
-            return return_id
+        return return_id
 
     def _resolve_selections(self, selections: list[dict], returnable: list[dict],
                             base_qty: int, pending: dict[tuple[str, int], int]) -> list[dict]:
@@ -1289,237 +1418,242 @@ class SalesService:
     def post_return(self, return_id: int, actor_id: int | None = None) -> dict:
         self._require(actor_id, "post_sales_return")
         with self.db.transaction() as conn:
-            sales_return = conn.execute(
-                "SELECT * FROM sales_returns WHERE id=?", (return_id,)
+            return self._post_return(conn, return_id, actor_id)
+
+    def _post_return(self, conn, return_id, actor_id):
+        sales_return = conn.execute(
+            "SELECT * FROM sales_returns WHERE id=?", (return_id,)
+        ).fetchone()
+        if sales_return is None or sales_return["status"] != "DRAFT":
+            raise SalesError("draft sales return not found")
+        invoice = conn.execute(
+            "SELECT * FROM sales WHERE id=?", (sales_return["sales_id"],)
+        ).fetchone()
+        if invoice is None or invoice["status"] != "POSTED":
+            raise SalesError("posted sales invoice not found")
+        if invoice["reversal_journal_entry_id"] is not None:
+            raise SalesError("cannot return a reversed sales invoice")
+        if invoice["invoice_date"][:10] > sales_return["return_date"][:10]:
+            raise SalesError("return date is before the sales invoice")
+        self._validate_refund_request(conn, sales_return)
+        if sales_return["refund_piastres"] > 0:
+            if actor_id is None:
+                raise PermissionDenied("refund requires an authorized user")
+            PermissionService(self.db).require(actor_id, "issue_customer_refund")
+        lines = conn.execute(
+            "SELECT * FROM sales_return_lines WHERE sales_return_id=? ORDER BY line_no",
+            (return_id,),
+        ).fetchall()
+        if not lines:
+            raise SalesError("sales return has no lines")
+
+        pending_sold: dict[int, int] = {}
+        pending_alloc: dict[tuple[str, int], int] = {}
+        planned: list[dict] = []
+        sellable_cost = 0
+        damaged_cost = 0
+        commercial_total = 0
+        for line in lines:
+            sales_line = conn.execute(
+                "SELECT * FROM sales_lines WHERE id=?", (line["sales_line_id"],)
             ).fetchone()
-            if sales_return is None or sales_return["status"] != "DRAFT":
-                raise SalesError("draft sales return not found")
-            invoice = conn.execute(
-                "SELECT * FROM sales WHERE id=?", (sales_return["sales_id"],)
-            ).fetchone()
-            if invoice is None or invoice["status"] != "POSTED":
-                raise SalesError("posted sales invoice not found")
-            if invoice["reversal_journal_entry_id"] is not None:
-                raise SalesError("cannot return a reversed sales invoice")
-            self._validate_refund_request(conn, sales_return)
-            if sales_return["refund_piastres"] > 0:
-                if actor_id is None:
-                    raise PermissionDenied("refund requires an authorized user")
-                PermissionService(self.db).require(actor_id, "issue_customer_refund")
-            lines = conn.execute(
-                "SELECT * FROM sales_return_lines WHERE sales_return_id=? ORDER BY line_no",
-                (return_id,),
+            if sales_line is None or sales_line["sales_id"] != invoice["id"]:
+                raise SalesError("sales line does not belong to the invoice")
+            product = self._product(conn, sales_line["product_id"], require_active=False)
+            selections = conn.execute(
+                "SELECT * FROM sales_return_line_allocations "
+                "WHERE sales_return_line_id=? ORDER BY id", (line["id"],)
             ).fetchall()
-            if not lines:
-                raise SalesError("sales return has no lines")
-
-            pending_sold: dict[int, int] = {}
-            pending_alloc: dict[tuple[str, int], int] = {}
-            planned: list[dict] = []
-            sellable_cost = 0
-            damaged_cost = 0
-            commercial_total = 0
-            for line in lines:
-                sales_line = conn.execute(
-                    "SELECT * FROM sales_lines WHERE id=?", (line["sales_line_id"],)
-                ).fetchone()
-                if sales_line is None or sales_line["sales_id"] != invoice["id"]:
-                    raise SalesError("sales line does not belong to the invoice")
-                product = self._product(conn, sales_line["product_id"])
-                selections = conn.execute(
-                    "SELECT * FROM sales_return_line_allocations "
-                    "WHERE sales_return_line_id=? ORDER BY id", (line["id"],)
-                ).fetchall()
-                if not selections:
-                    raise SalesError("sales return line has no allocation selection")
-                if sum(row["quantity_micros"] for row in selections) != line["base_qty_micros"]:
-                    raise SalesError("allocation selections must cover the returned base quantity")
-                returnable = self._returnable_for_line(conn, sales_line)
-                by_key = {(row["kind"], row["allocation_id"]): row for row in returnable}
-                line_selections = []
-                for selection in selections:
-                    key = (selection["allocation_kind"], selection["original_allocation_id"])
-                    row = by_key.get(key)
-                    if row is None:
-                        raise SalesError("allocation is no longer returnable")
-                    available = row["remaining_qty_micros"] - pending_alloc.get(key, 0)
-                    if selection["quantity_micros"] > available:
-                        raise SalesError("allocation selection exceeds the remaining returnable quantity")
-                    returned_qty = (
-                        self._returned_reel_qty(conn, row["allocation_id"])
-                        if key[0] == "REEL"
-                        else self._returned_lot_qty(conn, row["allocation_id"])
-                    )
-                    old = returned_qty + pending_alloc.get(key, 0)
-                    new = old + selection["quantity_micros"]
-                    cost = return_cost(row["original_cost_piastres"], row["original_qty_micros"], old, new)
-                    pending_alloc[key] = pending_alloc.get(key, 0) + selection["quantity_micros"]
-                    line_selections.append({
-                        "kind": key[0],
-                        "allocation_id": key[1],
-                        "quantity_micros": selection["quantity_micros"],
-                        "cost": cost,
-                        "lot_id": row["lot_id"],
-                        "reel_id": row["reel_id"],
-                        "original_qty_micros": row["original_qty_micros"],
-                        "original_cost_piastres": row["original_cost_piastres"],
-                    })
-                old_sold = self._posted_returned_sold_qty(conn, sales_line["id"]) + pending_sold.get(sales_line["id"], 0)
-                new_sold = old_sold + line["quantity_micros"]
-                commercial = return_cost(
-                    sales_line["net_piastres"], sales_line["quantity_micros"], old_sold, new_sold
+            if not selections:
+                raise SalesError("sales return line has no allocation selection")
+            if sum(row["quantity_micros"] for row in selections) != line["base_qty_micros"]:
+                raise SalesError("allocation selections must cover the returned base quantity")
+            returnable = self._returnable_for_line(conn, sales_line)
+            by_key = {(row["kind"], row["allocation_id"]): row for row in returnable}
+            line_selections = []
+            for selection in selections:
+                key = (selection["allocation_kind"], selection["original_allocation_id"])
+                row = by_key.get(key)
+                if row is None:
+                    raise SalesError("allocation is no longer returnable")
+                available = row["remaining_qty_micros"] - pending_alloc.get(key, 0)
+                if selection["quantity_micros"] > available:
+                    raise SalesError("allocation selection exceeds the remaining returnable quantity")
+                returned_qty = (
+                    self._returned_reel_qty(conn, row["allocation_id"])
+                    if key[0] == "REEL"
+                    else self._returned_lot_qty(conn, row["allocation_id"])
                 )
-                pending_sold[sales_line["id"]] = new_sold
-                line_cost = sum(row["cost"] for row in line_selections)
-                commercial_total += commercial
-                if line["condition"] == "SELLABLE":
-                    sellable_cost += line_cost
-                else:
-                    damaged_cost += line_cost
-                planned.append({
-                    "line": line,
-                    "sales_line": sales_line,
-                    "product": product,
-                    "selections": line_selections,
-                    "commercial": commercial,
-                    "cost": line_cost,
+                old = returned_qty + pending_alloc.get(key, 0)
+                new = old + selection["quantity_micros"]
+                cost = return_cost(row["original_cost_piastres"], row["original_qty_micros"], old, new)
+                pending_alloc[key] = pending_alloc.get(key, 0) + selection["quantity_micros"]
+                line_selections.append({
+                    "kind": key[0],
+                    "allocation_id": key[1],
+                    "quantity_micros": selection["quantity_micros"],
+                    "cost": cost,
+                    "lot_id": row["lot_id"],
+                    "reel_id": row["reel_id"],
+                    "original_qty_micros": row["original_qty_micros"],
+                    "original_cost_piastres": row["original_cost_piastres"],
                 })
-
-            outstanding = self._invoice_balance(conn, invoice)
-            ar_reduction = min(commercial_total, outstanding)
-            excess = commercial_total - ar_reduction
-            method = sales_return["settlement_method"]
-            if method == "CUSTOMER_CREDIT" and outstanding > 0:
-                raise SalesError("reduce outstanding AR first; customer-credit-only is not allowed")
-            if method in {"CASH_REFUND", "BANK_REFUND"}:
-                if sales_return["refund_piastres"] != excess:
-                    raise SalesError("cash/bank refund must equal the excess after reducing AR")
-                refund = sales_return["refund_piastres"]
-                credit = 0
-            elif method == "MIXED":
-                refund = sales_return["refund_piastres"]
-                if refund <= 0 or refund > excess:
-                    raise SalesError("mixed refund must be positive and no more than the excess")
-                credit = excess - refund
+            old_sold = self._posted_returned_sold_qty(conn, sales_line["id"]) + pending_sold.get(sales_line["id"], 0)
+            new_sold = old_sold + line["quantity_micros"]
+            commercial = return_cost(
+                sales_line["net_piastres"], sales_line["quantity_micros"], old_sold, new_sold
+            )
+            pending_sold[sales_line["id"]] = new_sold
+            line_cost = sum(row["cost"] for row in line_selections)
+            commercial_total += commercial
+            if line["condition"] == "SELLABLE":
+                sellable_cost += line_cost
             else:
-                refund = 0
-                credit = excess
-            if commercial_total == 0 and sellable_cost == 0 and damaged_cost == 0:
-                raise SalesError("sales return has no commercial or inventory cost value")
+                damaged_cost += line_cost
+            planned.append({
+                "line": line,
+                "sales_line": sales_line,
+                "product": product,
+                "selections": line_selections,
+                "commercial": commercial,
+                "cost": line_cost,
+            })
 
-            written: list[dict] = []
-            for seq, item in enumerate(planned, start=1):
-                layer_rows = []
-                result_lots: set[int] = set()
-                result_reels: set[int] = set()
-                for selection in item["selections"]:
-                    if selection["kind"] == "REEL":
-                        layer_id, lot_id, reel_id = self._create_returned_reel(
-                            conn, return_id=return_id, return_line_id=item["line"]["id"],
-                            sales_line_id=item["sales_line"]["id"],
-                            product_id=item["product"]["id"], selection=selection,
-                            return_date=sales_return["return_date"], actor_id=actor_id, seq=seq,
-                        )
-                        result_lots.add(lot_id)
-                        result_reels.add(reel_id)
-                    else:
-                        layer_id = create_layer(
-                            conn, selection["lot_id"], None, "CUSTOMER_RETURN",
-                            selection["quantity_micros"], selection["cost"],
-                            sales_return["return_date"], seq,
-                            parent_issue_allocation_id=selection["allocation_id"],
-                        )
-                        movement_id = create_movement(
-                            conn, "SALE_RETURN_IN", item["product"]["id"], selection["lot_id"], None,
-                            selection["quantity_micros"], selection["cost"], "IN",
-                            "SALES_RETURN", return_id, sales_return["return_date"],
-                            actor_id, item["line"]["id"],
-                        )
-                        conn.execute(
-                            "INSERT INTO lot_allocations(stock_movement_id,cost_layer_id,lot_id,sales_line_id,"
-                            "sales_return_line_id,allocation_role,quantity_micros,cost_piastres,direction,"
-                            "source_issue_allocation_id,created_layer_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                            (movement_id, layer_id, selection["lot_id"], item["sales_line"]["id"],
-                             item["line"]["id"], "SALE_RETURN", selection["quantity_micros"],
-                             selection["cost"], "IN", selection["allocation_id"], layer_id),
-                        )
-                        refresh_lot_status(conn, selection["lot_id"])
-                        result_lots.add(selection["lot_id"])
-                    layer_rows.append((layer_id, selection))
-                conn.execute(
-                    "UPDATE sales_return_lines SET commercial_value_piastres=?,cost_piastres=?,"
-                    "lot_id=?,reel_id=? WHERE id=?",
-                    (item["commercial"], item["cost"],
-                     next(iter(result_lots)) if len(result_lots) == 1 else None,
-                     next(iter(result_reels)) if len(result_reels) == 1 else None,
-                     item["line"]["id"]),
-                )
-                written.append({**item, "layer_rows": layer_rows})
+        outstanding = self._invoice_balance(conn, invoice)
+        ar_reduction = min(commercial_total, outstanding)
+        excess = commercial_total - ar_reduction
+        method = sales_return["settlement_method"]
+        if method == "CUSTOMER_CREDIT" and outstanding > 0:
+            raise SalesError("reduce outstanding AR first; customer-credit-only is not allowed")
+        if method in {"CASH_REFUND", "BANK_REFUND"}:
+            if sales_return["refund_piastres"] != excess:
+                raise SalesError("cash/bank refund must equal the excess after reducing AR")
+            refund = sales_return["refund_piastres"]
+            credit = 0
+        elif method == "MIXED":
+            refund = sales_return["refund_piastres"]
+            if refund <= 0 or refund > excess:
+                raise SalesError("mixed refund must be positive and no more than the excess")
+            credit = excess - refund
+        else:
+            refund = 0
+            credit = excess
+        if commercial_total == 0 and sellable_cost == 0 and damaged_cost == 0:
+            raise SalesError("sales return has no commercial or inventory cost value")
 
-            journal_lines: list[dict] = []
-            if commercial_total > 0:
-                journal_lines.append({"account_code": "4020", "debit": commercial_total,
-                                      "party_type": "CUSTOMER", "party_id": invoice["customer_id"]})
-                if ar_reduction:
-                    journal_lines.append({"account_code": "1100", "credit": ar_reduction,
-                                          "party_type": "CUSTOMER", "party_id": invoice["customer_id"]})
-                if credit:
-                    journal_lines.append({"account_code": "2020", "credit": credit,
-                                          "party_type": "CUSTOMER", "party_id": invoice["customer_id"]})
-                if refund:
-                    account = self._financial_account(conn, sales_return["financial_account_id"])
-                    journal_lines.append({"account_code": account["gl_code"], "credit": refund,
-                                          "party_type": "CUSTOMER", "party_id": invoice["customer_id"]})
-            if sellable_cost > 0:
-                journal_lines.append({"account_code": "1200", "debit": sellable_cost})
-                journal_lines.append({"account_code": "5010", "credit": sellable_cost})
-            if damaged_cost > 0:
-                journal_lines.append({"account_code": "5020", "debit": damaged_cost})
-                journal_lines.append({"account_code": "5010", "credit": damaged_cost})
-            journal_id = self.accounting.post_journal(
-                sales_return["return_date"], "SALES_RETURN", return_id, journal_lines,
-                description=f"مرتجع بيع {sales_return['document_no']}",
-                posted_by=actor_id, conn=conn,
-            )
-            if credit:
-                conn.execute(
-                    "INSERT INTO customer_credits(customer_id,source_type,source_id,amount_piastres,"
-                    "remaining_piastres,status) VALUES(?,?,?,?,?,?)",
-                    (invoice["customer_id"], "SALES_RETURN", return_id, credit, credit, "OPEN"),
-                )
-            for item in written:
-                if item["line"]["condition"] != "DAMAGED":
-                    continue
-                for layer_id, selection in item["layer_rows"]:
-                    self._damage_return_layer(
+        written: list[dict] = []
+        for seq, item in enumerate(planned, start=1):
+            layer_rows = []
+            result_lots: set[int] = set()
+            result_reels: set[int] = set()
+            for selection in item["selections"]:
+                if selection["kind"] == "REEL":
+                    layer_id, lot_id, reel_id = self._create_returned_reel(
                         conn, return_id=return_id, return_line_id=item["line"]["id"],
-                        layer_id=layer_id, product_id=item["product"]["id"],
-                        actor_id=actor_id, occurred_at=sales_return["return_date"],
-                        original_allocation_id=selection["allocation_id"],
+                        sales_line_id=item["sales_line"]["id"],
+                        product_id=item["product"]["id"], selection=selection,
+                        return_date=sales_return["return_date"], actor_id=actor_id, seq=seq,
                     )
-            any_damaged = any(line["condition"] == "DAMAGED" for line in lines)
-            damaged_cost_accounting = (
-                "POSTED_5020_5010" if any_damaged else "NOT_APPLICABLE"
-            )
+                    result_lots.add(lot_id)
+                    result_reels.add(reel_id)
+                else:
+                    layer_id = create_layer(
+                        conn, selection["lot_id"], None, "CUSTOMER_RETURN",
+                        selection["quantity_micros"], selection["cost"],
+                        sales_return["return_date"], seq,
+                        parent_issue_allocation_id=selection["allocation_id"],
+                    )
+                    movement_id = create_movement(
+                        conn, "SALE_RETURN_IN", item["product"]["id"], selection["lot_id"], None,
+                        selection["quantity_micros"], selection["cost"], "IN",
+                        "SALES_RETURN", return_id, sales_return["return_date"],
+                        actor_id, item["line"]["id"],
+                    )
+                    conn.execute(
+                        "INSERT INTO lot_allocations(stock_movement_id,cost_layer_id,lot_id,sales_line_id,"
+                        "sales_return_line_id,allocation_role,quantity_micros,cost_piastres,direction,"
+                        "source_issue_allocation_id,created_layer_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (movement_id, layer_id, selection["lot_id"], item["sales_line"]["id"],
+                         item["line"]["id"], "SALE_RETURN", selection["quantity_micros"],
+                         selection["cost"], "IN", selection["allocation_id"], layer_id),
+                    )
+                    refresh_lot_status(conn, selection["lot_id"])
+                    result_lots.add(selection["lot_id"])
+                layer_rows.append((layer_id, selection))
             conn.execute(
-                "UPDATE sales_returns SET status='POSTED',commercial_total_piastres=?,"
-                "inventory_cost_piastres=?,ar_reduction_piastres=?,customer_credit_piastres=?,"
-                "refund_piastres=?,damaged_cost_accounting=?,journal_entry_id=?,posted_at=? WHERE id=?",
-                (commercial_total, sellable_cost + damaged_cost, ar_reduction, credit,
-                 refund, damaged_cost_accounting, journal_id, _now(), return_id),
+                "UPDATE sales_return_lines SET commercial_value_piastres=?,cost_piastres=?,"
+                "lot_id=?,reel_id=? WHERE id=?",
+                (item["commercial"], item["cost"],
+                 next(iter(result_lots)) if len(result_lots) == 1 else None,
+                 next(iter(result_reels)) if len(result_reels) == 1 else None,
+                 item["line"]["id"]),
             )
-            self._audit(conn, "SALES_RETURN_POSTED", "sales_return", return_id, actor_id,
-                        sales_return["reason"])
-            return {
-                "return_id": return_id,
-                "journal_id": journal_id,
-                "commercial_total": commercial_total,
-                "inventory_cost": sellable_cost + damaged_cost,
-                "ar_reduction": ar_reduction,
-                "customer_credit": credit,
-                "refund": refund,
-                "damaged_cost_accounting": damaged_cost_accounting,
-            }
+            written.append({**item, "layer_rows": layer_rows})
+
+        journal_lines: list[dict] = []
+        if commercial_total > 0:
+            journal_lines.append({"account_code": "4020", "debit": commercial_total,
+                                  "party_type": "CUSTOMER", "party_id": invoice["customer_id"]})
+            if ar_reduction:
+                journal_lines.append({"account_code": "1100", "credit": ar_reduction,
+                                      "party_type": "CUSTOMER", "party_id": invoice["customer_id"]})
+            if credit:
+                journal_lines.append({"account_code": "2020", "credit": credit,
+                                      "party_type": "CUSTOMER", "party_id": invoice["customer_id"]})
+            if refund:
+                account = self._financial_account(conn, sales_return["financial_account_id"])
+                journal_lines.append({"account_code": account["gl_code"], "credit": refund,
+                                      "party_type": "CUSTOMER", "party_id": invoice["customer_id"]})
+        if sellable_cost > 0:
+            journal_lines.append({"account_code": "1200", "debit": sellable_cost})
+            journal_lines.append({"account_code": "5010", "credit": sellable_cost})
+        if damaged_cost > 0:
+            journal_lines.append({"account_code": "5020", "debit": damaged_cost})
+            journal_lines.append({"account_code": "5010", "credit": damaged_cost})
+        journal_id = self.accounting.post_journal(
+            sales_return["return_date"], "SALES_RETURN", return_id, journal_lines,
+            description=f"مرتجع بيع {sales_return['document_no']}",
+            posted_by=actor_id, conn=conn,
+        )
+        if credit:
+            conn.execute(
+                "INSERT INTO customer_credits(customer_id,source_type,source_id,amount_piastres,"
+                "remaining_piastres,status) VALUES(?,?,?,?,?,?)",
+                (invoice["customer_id"], "SALES_RETURN", return_id, credit, credit, "OPEN"),
+            )
+        for item in written:
+            if item["line"]["condition"] != "DAMAGED":
+                continue
+            for layer_id, selection in item["layer_rows"]:
+                self._damage_return_layer(
+                    conn, return_id=return_id, return_line_id=item["line"]["id"],
+                    layer_id=layer_id, product_id=item["product"]["id"],
+                    actor_id=actor_id, occurred_at=sales_return["return_date"],
+                    original_allocation_id=selection["allocation_id"],
+                )
+        any_damaged = any(line["condition"] == "DAMAGED" for line in lines)
+        damaged_cost_accounting = (
+            "POSTED_5020_5010" if any_damaged else "NOT_APPLICABLE"
+        )
+        conn.execute(
+            "UPDATE sales_returns SET status='POSTED',commercial_total_piastres=?,"
+            "inventory_cost_piastres=?,ar_reduction_piastres=?,customer_credit_piastres=?,"
+            "refund_piastres=?,damaged_cost_accounting=?,journal_entry_id=?,posted_at=? WHERE id=?",
+            (commercial_total, sellable_cost + damaged_cost, ar_reduction, credit,
+             refund, damaged_cost_accounting, journal_id, _now(), return_id),
+        )
+        self._audit(conn, "SALES_RETURN_POSTED", "sales_return", return_id, actor_id,
+                    sales_return["reason"])
+        return {
+            "return_id": return_id,
+            "journal_id": journal_id,
+            "commercial_total": commercial_total,
+            "inventory_cost": sellable_cost + damaged_cost,
+            "ar_reduction": ar_reduction,
+            "customer_credit": credit,
+            "refund": refund,
+            "damaged_cost_accounting": damaged_cost_accounting,
+        }
 
     def _create_returned_reel(self, conn, *, return_id: int, return_line_id: int | None,
                               sales_line_id: int, product_id: int, selection: dict,

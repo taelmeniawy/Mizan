@@ -15,8 +15,14 @@ APP_ORGANIZATION = "Mizan"
 STYLESHEET = """
 QWidget { background: #f3f5f8; color: #17212b; }
 QMainWindow, QDialog { background: #f3f5f8; }
-QFrame#Card { background: #ffffff; border: 1px solid #dde3ea; border-radius: 10px; }
+QFrame#Card, QFrame#LoginCard { background: #ffffff; border: 1px solid #dde3ea; border-radius: 10px; }
+QFrame#LoginCard QLabel, QFrame#LoginCard QCheckBox, QFrame#LoginCard QStackedWidget, QWidget#SetupStep {
+    background: transparent;
+}
 QFrame#Sidebar { background: #10263f; border: none; }
+QFrame#Sidebar QLabel { background: transparent; }
+QFrame#Sidebar QPushButton#Secondary { color: #eaf1fb; border-color: #58728c; }
+QFrame#Sidebar QPushButton#Secondary:hover { background: #1f4e79; }
 QLabel#Brand { color: #ffffff; font-size: 24px; font-weight: bold; padding: 18px 16px 4px 16px; }
 QLabel#BrandHint { color: #9fb3c8; padding: 0 16px 16px 16px; font-size: 11px; }
 QLabel#Title { font-size: 21px; font-weight: bold; }
@@ -27,7 +33,7 @@ QLabel#SidebarUser { color: #d7e2ee; padding: 0 16px; }
 QLabel#SidebarRole { color: #8fa6bd; padding: 0 16px 10px 16px; font-size: 11px; }
 QLabel#Hint { color: #64748b; font-size: 11px; }
 QListWidget#Nav { background: transparent; border: none; color: #cfdae7; font-size: 14px; outline: none; }
-QListWidget#Nav::item { padding: 11px 14px; border-radius: 8px; margin: 2px 10px; }
+QListWidget#Nav::item { padding: 8px 14px; border-radius: 8px; margin: 2px 10px; }
 QListWidget#Nav::item:selected { background: #1f4e79; color: #ffffff; }
 QListWidget#Nav::item:hover { background: #173a5c; }
 QPushButton { background: #1f6feb; color: #ffffff; border: none; border-radius: 7px;
@@ -37,12 +43,13 @@ QPushButton:disabled { background: #b9c5d3; color: #eef2f7; }
 QPushButton#Secondary { background: transparent; color: #1f4e79; border: 1px solid #b9c7d6;
                         font-weight: normal; }
 QPushButton#Secondary:hover { background: #eaf1fb; }
+QPushButton#Secondary:disabled { color: #718093; border-color: #d4dce6; }
 QPushButton#Danger { background: #b42318; }
 QLineEdit, QComboBox, QDateEdit, QSpinBox { background: #ffffff; border: 1px solid #cdd6e0;
                                             border-radius: 7px; padding: 6px 9px; }
 QLineEdit:focus, QComboBox:focus, QDateEdit:focus, QSpinBox:focus { border: 1px solid #1f6feb; }
-QTableWidget { background: #ffffff; border: 1px solid #dee4ec; border-radius: 8px;
-               gridline-color: #e8edf3; }
+QTableView, QTableWidget { background: #ffffff; border: 1px solid #dee4ec; border-radius: 8px;
+                         gridline-color: #e8edf3; }
 QHeaderView::section { background: #f7f9fc; color: #33475b; border: none; border-bottom: 1px solid #dee4ec;
                        padding: 8px; font-weight: bold; }
 QProgressBar { border: 1px solid #cdd6e0; border-radius: 6px; background: #eef2f7;

@@ -43,6 +43,20 @@ the font from that installed package:
 .\\.venv\\Scripts\\python.exe -c "from mizan.rendering import load_bundled_fonts; print(load_bundled_fonts())"
 ```
 
+## Application entry point
+
+The desktop shell is started with:
+
+```powershell
+.\.venv\Scripts\python.exe -m mizan
+# or, after installation, the GUI script declared in pyproject.toml:
+#   [project.gui-scripts]
+#   mizan = "mizan.app:main"
+```
+
+`--data-dir` selects the data root (database, documents, backups, logs). The
+default is `%LOCALAPPDATA%\Mizan`; `MIZAN_DATA_DIR` overrides it.
+
 ## PyInstaller
 
 When the Windows executable is built in Phase 10, include the package data
@@ -66,5 +80,8 @@ destination must keep the `mizan/assets/...` relative layout.
 
 - Actual PyInstaller executable build, clean-machine install, and code signing
   are Phase 10 work and are not claimed here.
+- The Qt widget shell needs the PySide6 platform plugins (PyInstaller's PySide6
+  hooks normally collect them). Verify the built executable starts the login
+  screen with a temporary `--data-dir` before shipping.
 - The renderer uses the bundled font for Arabic; Qt may use a system fallback for
   Latin characters/codes/punctuation that Noto Naskh Arabic does not contain.

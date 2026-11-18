@@ -242,35 +242,40 @@ class BackupService:
             raise BackupError(f"invalid backup: {exc}") from exc
 
     def restore(self, bundle: str | Path, destination: str | Path, *, actor_id: int, reason: str,
-                key: bytes | None = None) -> Path:
+                key: bytes | None = None, progress=None) -> Path:
         PermissionService(self.db).require(actor_id, "restore_database")
         if not reason.strip():
             raise BackupError("restore requires a reason")
         if Path(bundle).is_file() or key is not None:
             if not Path(bundle).is_file():
                 raise BackupError("expected an encrypted backup file")
+            _notify(progress, "verify")
             with tempfile.TemporaryDirectory() as local:
                 try:
                     unseal(Path(bundle), Path(local), key)
                 except EncryptionError as exc:
                     raise BackupError(str(exc)) from exc
-                return self._restore_directory(local, destination, actor_id, reason)
-        return self._restore_directory(bundle, destination, actor_id, reason)
+                return self._restore_directory(local, destination, actor_id, reason, progress)
+        return self._restore_directory(bundle, destination, actor_id, reason, progress)
 
-    def _restore_directory(self, bundle, destination, actor_id, reason):
+    def _restore_directory(self, bundle, destination, actor_id, reason, progress=None):
+        _notify(progress, "verify")
         manifest = self.verify(bundle)
         destination = self._destination(destination)
         with tempfile.TemporaryDirectory(prefix=".mizan-restore-", dir=destination.parent) as temporary:
             stage = Path(temporary) / "bundle"
             stage.mkdir()
+            _notify(progress, "copy")
             for relative in manifest["files"]:
                 target = _path(stage, relative)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(_path(Path(bundle).resolve(), relative), target)
             (stage / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            _notify(progress, "verify")
             self.verify(stage)  # Recheck copied bytes before publishing the restored directory.
             (stage / "manifest.json").unlink()  # A restored working DB will change after opening.
             (stage / "documents").mkdir(exist_ok=True)
+            _notify(progress, "publish")
             _publish(stage, destination)
         self._audit("DATABASE_RESTORED", actor_id, reason.strip(), destination)
         return destination

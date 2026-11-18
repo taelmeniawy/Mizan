@@ -63,7 +63,7 @@ PERMISSION_DEFS = {
 
 ROLE_PERMISSIONS = {
     "OWNER": set(PERMISSION_DEFS),
-    "MANAGER": set(PERMISSION_DEFS) - {"manage_users", "manage_roles", "manage_settings", "backup_database", "restore_database"},
+    "MANAGER": set(PERMISSION_DEFS) - {"manage_users", "manage_roles", "manage_settings", "restore_database"},
     "CASHIER": {"view_dashboard", "create_sales_draft", "post_sales", "apply_item_discount",
                 "view_customer_balance", "manage_customer_receipts", "create_quotation"},
 }

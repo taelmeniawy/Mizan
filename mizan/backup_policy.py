@@ -166,6 +166,8 @@ class ScheduledBackups:
 
     @staticmethod
     def _bundles(directory: Path, category: str) -> list[Path]:
+        if not directory.is_dir():
+            return []
         pattern = _DAILY if category == "daily" else _MONTHLY
         found = []
         for path in directory.iterdir():

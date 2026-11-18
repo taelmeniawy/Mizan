@@ -24,10 +24,14 @@ from .common import make_subtitle, make_title
 from .dashboard import DashboardPage
 from .diagnostics import DiagnosticsPage
 from .login import LoginPage
+from .master import MasterDataPage
 
-# key, Arabic label, required permission
+# key, Arabic label, permission or permissions (any one grants the page)
 NAV_ITEMS = (
     ("dashboard", "لوحة التشغيل", "view_dashboard"),
+    ("master", "البيانات الأساسية", (
+        "manage_products", "manage_customers", "manage_suppliers", "manage_projects",
+    )),
     ("backup", "النسخ الاحتياطي", "backup_database"),
     ("audit", "سجل التدقيق", "view_audit_log"),
     ("diagnostics", "سلامة البيانات", "backup_database"),
@@ -82,7 +86,8 @@ class Shell(QWidget):
 
         self.content = QStackedWidget()
         for key, title, permission in NAV_ITEMS:
-            if not context.has_permission(user_id, permission):
+            permissions = permission if isinstance(permission, tuple) else (permission,)
+            if not any(context.has_permission(user_id, item) for item in permissions):
                 continue
             page = self._build_page(key)
             self.pages[key] = page
@@ -111,6 +116,8 @@ class Shell(QWidget):
         try:
             if key == "dashboard":
                 return DashboardPage(self.context)
+            if key == "master":
+                return MasterDataPage(self.context, self.user_id)
             if key == "backup":
                 return BackupPage(self.context, self.user_id)
             if key == "audit":

@@ -19,6 +19,7 @@ from mizan.ui.dashboard import DashboardPage
 from mizan.ui.diagnostics import DiagnosticsPage
 from mizan.ui.login import LoginPage
 from mizan.ui.main_window import MainWindow
+from mizan.ui.master import MasterDataPage
 
 
 @pytest.fixture()
@@ -68,9 +69,10 @@ def test_first_run_login_creates_the_owner_and_opens_the_shell(qt_app, context):
 
     assert page.create_owner() is True
     assert window.stack.currentWidget() is window.shell
-    assert window.shell.nav.count() == 4
-    assert set(window.shell.pages) == {"dashboard", "backup", "audit", "diagnostics"}
+    assert window.shell.nav.count() == 5
+    assert set(window.shell.pages) == {"dashboard", "master", "backup", "audit", "diagnostics"}
     assert isinstance(window.shell.pages["dashboard"], DashboardPage)
+    assert isinstance(window.shell.pages["master"], MasterDataPage)
     assert isinstance(window.shell.pages["backup"], BackupPage)
     assert isinstance(window.shell.pages["audit"], AuditPage)
     assert isinstance(window.shell.pages["diagnostics"], DiagnosticsPage)
@@ -99,7 +101,7 @@ def test_shell_navigation_follows_permissions_and_logout_returns_to_login(qt_app
     cashier = context.auth.create_user("cashier", "الكاشير", "cashier-pass", ["CASHIER"])
     window = MainWindow(context)
     window.login_succeeded(owner)
-    assert window.shell.nav.count() == 4
+    assert window.shell.nav.count() == 5
 
     window.logout()
     assert window.shell is None
@@ -250,3 +252,90 @@ def test_restore_needs_the_permission_and_a_reason(qt_app, owner_context, tmp_pa
     assert context.db.scalar(
         "SELECT COUNT(*) FROM audit_events WHERE event_type='DATABASE_RESTORED'"
     ) == 1
+
+
+def test_master_page_creates_units_products_and_deactivates(qt_app, owner_context):
+    context, owner = owner_context
+    page = MasterDataPage(context, owner)
+    assert page.tabs.count() == 5
+
+    page.units.code.setText("PIECE")
+    page.units.name.setText("قطعة")
+    assert page.units.add_unit() is True
+    assert page.units.table.rowCount() == 1
+    assert page.units.table.item(0, 0).text() == "PIECE"
+
+    page.products.refresh()
+    assert page.products.unit.findData("PIECE") >= 0
+    page.products.code.setText("P-1")
+    page.products.name.setText("سلك")
+    page.products.unit.setCurrentIndex(page.products.unit.findData("PIECE"))
+    page.products.tracking.setCurrentIndex(page.products.tracking.findData("LOT"))
+    assert page.products.add_product() is True
+    assert page.products.table.rowCount() == 1
+    assert page.products.table.item(0, 4).text() == "نشط"
+
+    page.products.table.selectRow(0)
+    product_id = context.db.scalar("SELECT id FROM products WHERE code='P-1'")
+    page.products.deactivate_product(product_id)
+    assert page.products.table.item(0, 4).text() == "معطّل"
+    assert context.db.scalar("SELECT is_active FROM products WHERE code='P-1'") == 0
+
+
+def test_master_page_creates_customers_suppliers_and_projects(qt_app, owner_context):
+    context, owner = owner_context
+    page = MasterDataPage(context, owner)
+
+    page.customers.code.setText("C-1")
+    page.customers.name.setText("مقاول النور")
+    page.customers.customer_type.setCurrentIndex(
+        page.customers.customer_type.findData("CONTRACTOR")
+    )
+    assert page.customers.add_customer() is True
+    assert page.customers.table.rowCount() == 1
+    assert page.customers.table.item(0, 2).text() == "مقاول"
+
+    page.suppliers.code.setText("S-1")
+    page.suppliers.name.setText("مورد")
+    assert page.suppliers.add_supplier() is True
+    assert page.suppliers.table.rowCount() == 1
+
+    contractor_id = context.db.scalar("SELECT id FROM customers WHERE code='C-1'")
+    page.projects.refresh()
+    assert page.projects.contractor.findData(contractor_id) >= 0
+    page.projects.code.setText("PRJ-1")
+    page.projects.name.setText("مشروع أ")
+    assert page.projects.add_project() is True
+    assert page.projects.table.rowCount() == 1
+    assert page.projects.table.item(0, 2).text() == "مقاول النور"
+
+    page.customers.code.setText("C-1")
+    page.customers.name.setText("مكرر")
+    assert page.customers.add_customer() is False
+    assert "تعذر" in page.customers.message.text()
+
+
+def test_master_page_requires_a_contractor_before_projects(qt_app, owner_context):
+    context, owner = owner_context
+    page = MasterDataPage(context, owner)
+    page.customers.code.setText("C-RETAIL")
+    page.customers.name.setText("عميل تجزئة")
+    page.customers.customer_type.setCurrentIndex(
+        page.customers.customer_type.findData("RETAIL")
+    )
+    assert page.customers.add_customer() is True
+
+    page.projects.refresh()
+    assert page.projects.contractor.count() == 0
+    page.projects.code.setText("PRJ-X")
+    page.projects.name.setText("مشروع")
+    assert page.projects.add_project() is False
+    assert "مقاول" in page.projects.message.text()
+
+
+def test_master_page_hides_tabs_without_permission(qt_app, owner_context):
+    context, _ = owner_context
+    cashier = context.auth.create_user("cashier", "الكاشير", "cashier-pass", ["CASHIER"])
+    page = MasterDataPage(context, cashier)
+    assert page.tabs.count() == 1  # placeholder only
+    assert page.products is None and page.units is None
